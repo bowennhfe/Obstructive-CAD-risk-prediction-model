@@ -1,0 +1,33 @@
+# ========== Python 生成文件 ==========
+__pycache__/
+*.pyc
+*.pyo
+*.pkl
+*.joblib
+*.log
+
+# ========== 输出数据/结果 ==========
+data_preprocessing/
+vif_analysis/
+feature_selection/
+Model Selection/
+Model Development/
+Model Growth Analysis/
+Clinical_Plots_R/
+
+# 根目录下的 CSV 数据文件
+Derivation cohort.csv
+Temporal external validation cohort.csv
+Geographical external validation cohort.csv
+
+# 图片汇总文件夹
+图片汇总/
+
+# ========== R 临时文件 ==========
+.RData
+.Rhistory
+*.Rout
+
+# ========== 系统文件 ==========
+.DS_Store
+Thumbs.db
