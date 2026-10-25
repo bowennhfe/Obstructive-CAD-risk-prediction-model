@@ -12,13 +12,15 @@ vif_analysis/
 feature_selection/
 Model Selection/
 Model Development/
-Model Growth Analysis/
+Subgroup Analysis/
 Clinical_Plots_R/
+Prospective Validation/
 
-# 根目录下的 CSV 数据文件
+# 根目录下的 CSV 数据文件（患者级数据，严禁公开）
 Derivation cohort.csv
 Temporal external validation cohort.csv
 Geographical external validation cohort.csv
+prospective cohort.csv
 
 # 图片汇总文件夹
 图片汇总/

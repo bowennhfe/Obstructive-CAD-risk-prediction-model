@@ -1,11 +1,10 @@
 # =============================================================================
-# 07_Clinical_Plots_R.R — SCI标准临床预测模型图表生成（与Python风格一致）
+# 06_Clinical_Plots_R.R — SCI标准临床预测模型图表生成（与Python风格一致）
 # =============================================================================
-# 功能：分 10 步生成 8 类临床图表，完全符合医学SCI顶刊出版要求：
-#   生长曲线、亚组森林图、风险分层点图、校准曲线、决策曲线（DCA）、
-#   连续净收益、避免不必要干预数（NIA）、贝叶斯DCA。
-#   其中校准曲线与 DCA 各含校准前/后双版本（计为 2 步），
-#   贝叶斯 DCA 另输出跨队列净收益比较图（Bayesian_Cohort_Comparison）。
+# 功能：分 10 步生成临床图表，完全符合医学SCI顶刊出版要求：
+#   亚组森林图、风险分层点图、临床影响曲线、校准曲线、决策曲线（DCA）、
+#   连续净收益、避免不必要干预数（NIA）。
+#   其中校准曲线与 DCA 各含校准前/后双版本（各计 3 步）。
 # 输入：各CSV文件（来自 01~06 Python流程）
 # 输出：TIFF (LZW) + PDF + PNG，按要求DPI
 # =============================================================================
@@ -62,7 +61,7 @@ if (length(file_arg) > 0) {
 }
 MODEL_SEL_DIR <- file.path(BASE_DIR, "Model Selection")
 MODEL_DEV_DIR <- file.path(BASE_DIR, "Model Development")
-MODEL_GROWTH_DIR <- file.path(BASE_DIR, "Model Growth Analysis")
+SUBGROUP_DIR <- file.path(BASE_DIR, "Subgroup Analysis")
 VIF_DIR <- file.path(BASE_DIR, "vif_analysis")
 # 07 脚本所有图表统一输出到新文件夹
 OUTPUT_DIR <- file.path(BASE_DIR, "Clinical_Plots_R")
@@ -71,7 +70,6 @@ dir.create(OUTPUT_DIR, showWarnings = FALSE, recursive = TRUE)
 # 启动时校验关键输入 CSV 存在性（来自上游 01~06 流程），缺失即中止并给出明确路径
 required_inputs <- c(
   file.path(MODEL_SEL_DIR, "model_selection_metrics.csv"),
-  file.path(MODEL_GROWTH_DIR, "growth_curve_data.csv"),
   file.path(MODEL_DEV_DIR, "risk_stratification_results.csv")
 )
 missing_inputs <- required_inputs[!file.exists(required_inputs)]
@@ -169,89 +167,12 @@ read_model_name <- function() {
 # =============================================================================
 
 # ---------------------------------------------------------------
-# 5.1 模型生长曲线
-# ---------------------------------------------------------------
-plot_growth_curve <- function(model_name) {
-  cat("[1/11] 绘制生长曲线...\n")
-  
-  data_path <- file.path(MODEL_GROWTH_DIR, "growth_curve_data.csv")
-  if (!file.exists(data_path)) {
-    cat("  WARNING: growth_curve_data.csv not found, skipping.\n")
-    return(NULL)
-  }
-  
-  df <- read.csv(data_path, stringsAsFactors = FALSE)
-  # 06 脚本在 0% 时间点无历史数据可重抽样，CI 输出为 NaN，直接传给 geom_ribbon 会断带。
-  # 此处将缺失（NA/NaN）的 CI 端点以对应点估计替代（该点仅显示均值，不显示不确定带）。
-  fix_ci <- function(ci, est) { ci[is.na(ci)] <- est[is.na(ci)]; ci }
-  df$auc_ci_lo   <- fix_ci(df$auc_ci_lo,   df$auc_mean)
-  df$auc_ci_hi   <- fix_ci(df$auc_ci_hi,   df$auc_mean)
-  df$brier_ci_lo <- fix_ci(df$brier_ci_lo, df$brier_mean)
-  df$brier_ci_hi <- fix_ci(df$brier_ci_hi, df$brier_mean)
-  df$pct_label <- paste0(df$pct * 100, "%")
-  df$pct_label[df$pct == 0] <- "0%"
-  # 确保顺序
-  df$pct_label <- factor(df$pct_label, levels = c("0%", "5%", "10%", "20%", "40%", "60%", "80%", "100%"))
-  
-  # 自适应 y 轴范围（依据实际数据 + CI，避免硬编码导致曲线显示平坦）
-  auc_bottom <- max(0.62, min(df$auc_ci_lo, na.rm = TRUE) - 0.02)
-  auc_top    <- min(0.95, max(df$auc_ci_hi, na.rm = TRUE) + 0.02)
-  brier_bottom <- max(0, min(df$brier_ci_lo, na.rm = TRUE) - 0.005)
-  brier_top    <- min(0.30, max(df$brier_ci_hi, na.rm = TRUE) + 0.005)
-  
-  # 上分面：AUC
-  p_auc <- ggplot(df, aes(x = pct_label, y = auc_mean, group = 1)) +
-    geom_ribbon(aes(ymin = auc_ci_lo, ymax = auc_ci_hi), fill = COL_DERIV, alpha = 0.2) +
-    geom_line(color = COL_DERIV, linewidth = 1.2) +
-    geom_point(color = COL_DERIV, size = 2.5) +
-    scale_y_continuous(limits = c(auc_bottom, auc_top), labels = scales::label_number(accuracy = 0.001)) +
-    labs(y = "AUC (Geographical Validation)") +
-    theme_bw(base_size = FONT_LABEL, base_family = "sans") +
-    theme(
-      plot.title = element_blank(),
-      axis.title.x = element_blank(),
-      axis.title.y = element_text(size = FONT_LABEL),
-      axis.text = element_text(size = FONT_TICK),
-      panel.grid.minor = element_blank(),
-      panel.border = element_blank(),
-      axis.line = element_line(color = "black", linewidth = 0.5),
-      plot.margin = margin(5, 10, 2, 5)
-    )
-  
-  # 下分面：Brier
-  p_brier <- ggplot(df, aes(x = pct_label, y = brier_mean, group = 1)) +
-    geom_ribbon(aes(ymin = brier_ci_lo, ymax = brier_ci_hi), fill = COL_RED, alpha = 0.2) +
-    geom_line(color = COL_RED, linewidth = 1.2) +
-    geom_point(color = COL_RED, size = 2.5) +
-    scale_y_continuous(limits = c(brier_bottom, brier_top), labels = scales::label_number(accuracy = 0.001)) +
-    labs(x = "Temporal Data Added (%)", y = "Brier Score") +
-    theme_bw(base_size = FONT_LABEL, base_family = "sans") +
-    theme(
-      plot.title = element_blank(),
-      axis.title.x = element_text(size = FONT_LABEL),
-      axis.title.y = element_text(size = FONT_LABEL),
-      axis.text = element_text(size = FONT_TICK),
-      panel.grid.minor = element_blank(),
-      panel.border = element_blank(),
-      axis.line = element_line(color = "black", linewidth = 0.5),
-      plot.margin = margin(2, 10, 5, 5)
-    )
-  
-  p_combined <- p_auc / p_brier + plot_layout(heights = c(1, 1))
-  
-  save_sci_plot(p_combined, paste0("Growth_Curve_Split_", model_name),
-                width = 7.0, height = 6.0, dpi_type = "line")
-  cat("  Growth curve done.\n")
-  return(p_combined)
-}
-
-# ---------------------------------------------------------------
-# 5.2 亚组森林图
+# 5.1 亚组森林图
 # ---------------------------------------------------------------
 plot_subgroup_forest <- function(model_name) {
-  cat("[2/11] 绘制亚组森林图...\n")
+  cat("[1/10] 绘制亚组森林图...\n")
   
-  data_path <- file.path(MODEL_GROWTH_DIR, paste0("Subgroup_Performance_", model_name, ".csv"))
+  data_path <- file.path(SUBGROUP_DIR, paste0("Subgroup_Performance_", model_name, ".csv"))
   if (!file.exists(data_path)) {
     cat("  WARNING: Subgroup_Performance_", model_name, ".csv not found, skipping.\n", sep = "")
     return(NULL)
@@ -405,10 +326,10 @@ plot_subgroup_forest <- function(model_name) {
 }
 
 # ---------------------------------------------------------------
-# 5.3 风险分层点图（Cleveland Dot Plot）
+# 5.2 风险分层点图（Cleveland Dot Plot）
 # ---------------------------------------------------------------
 plot_risk_stratification <- function() {
-  cat("[3/11] 绘制风险分层点图...\n")
+  cat("[2/10] 绘制风险分层点图...\n")
   
   data_path <- file.path(MODEL_DEV_DIR, "risk_stratification_results.csv")
   if (!file.exists(data_path)) {
@@ -473,12 +394,12 @@ plot_risk_stratification <- function() {
   group_levels <- unique(na.omit(group_levels))
   df$Risk_Group <- factor(df$Risk_Group, levels = group_levels)
   
-  # 队列颜色
-  cohort_colors <- c("Derivation" = COL_DERIV, "Temporal" = COL_TEMP, "Geographical" = COL_GEO)
-  cohort_shapes <- c("Derivation" = 16, "Temporal" = 15, "Geographical" = 17)
+  # 队列颜色（风险分层仅覆盖 Derivation / Temporal，地理集已按需求移除）
+  cohort_colors <- c("Derivation" = COL_DERIV, "Temporal" = COL_TEMP)
+  cohort_shapes <- c("Derivation" = 16, "Temporal" = 15)
   
   # Y 轴偏移
-  y_offset <- c("Derivation" = 0.18, "Temporal" = -0.18, "Geographical" = -0.28)
+  y_offset <- c("Derivation" = 0.18, "Temporal" = -0.18)
   
   df$y_pos <- as.numeric(df$Risk_Group) + y_offset[df$Cohort]
   
@@ -532,10 +453,10 @@ plot_risk_stratification <- function() {
 }
 
 # ---------------------------------------------------------------
-# 5.3b 临床影响曲线（Clinical Impact Curve）
+# 5.2b 临床影响曲线（Clinical Impact Curve）
 # ---------------------------------------------------------------
 plot_clinical_impact <- function(model_name) {
-  cat("[3.5/11] 绘制临床影响曲线...\n")
+  cat("[2.5/10] 绘制临床影响曲线...\n")
 
   # 读取三个队列的预测概率（来自 05_Model_Development 输出）
   cohorts <- list(
@@ -658,7 +579,7 @@ plot_clinical_impact <- function(model_name) {
 }
 
 # ---------------------------------------------------------------
-# 5.4 校准曲线（校准前/校准后双版本）
+# 5.3 校准曲线（校准前/校准后双版本）
 # ---------------------------------------------------------------
 plot_calibration_curves <- function(model_name, use_calibrated = TRUE, file_suffix = "") {
   # 步骤号/标签随 file_suffix 与 use_calibrated 变化
@@ -667,15 +588,15 @@ plot_calibration_curves <- function(model_name, use_calibrated = TRUE, file_suff
   #   file_suffix=="_intercept_recalibrated"  -> 截距重校准补充图
   if (file_suffix == "_intercept_recalibrated") {
     calib_label <- "Intercept-Calibrated"
-    step_no <- "6"
+    step_no <- "5"
   } else if (use_calibrated) {
     calib_label <- "Post-Calibration (Platt)"
-    step_no <- "5"
+    step_no <- "4"
   } else {
     calib_label <- "Pre-Calibration (Raw)"
-    step_no <- "4"
+    step_no <- "3"
   }
-  cat(sprintf("[%s/11] 绘制校准曲线 (%s)...\n", step_no, calib_label))
+  cat(sprintf("[%s/10] 绘制校准曲线 (%s)...\n", step_no, calib_label))
   
   cohorts <- list(
     list(name = "Derivation", color = COL_DERIV),
@@ -865,7 +786,7 @@ plot_calibration_curves <- function(model_name, use_calibrated = TRUE, file_suff
 }
 
 # ---------------------------------------------------------------
-# 5.6 决策曲线（DCA）
+# 5.4 决策曲线（DCA）
 # ---------------------------------------------------------------
 plot_dca_curves <- function(model_name, use_calibrated = TRUE, file_suffix = "") {
   # 步骤号/标签随 file_suffix 与 use_calibrated 变化（与校准曲线分组对应）
@@ -874,15 +795,15 @@ plot_dca_curves <- function(model_name, use_calibrated = TRUE, file_suffix = "")
   #   file_suffix=="_intercept_recalibrated"  -> 截距重校准补充图
   if (file_suffix == "_intercept_recalibrated") {
     calib_label <- "Intercept-Calibrated"
-    step_no <- "9"
+    step_no <- "8"
   } else if (use_calibrated) {
     calib_label <- "Post-Calibration (Platt)"
-    step_no <- "8"
+    step_no <- "7"
   } else {
     calib_label <- "Pre-Calibration (Raw)"
-    step_no <- "7"
+    step_no <- "6"
   }
-  cat(sprintf("[%s/11] 绘制决策曲线 (%s)...\n", step_no, calib_label))
+  cat(sprintf("[%s/10] 绘制决策曲线 (%s)...\n", step_no, calib_label))
   cat(sprintf("  DCA %s: Treat None / Treat All / Model curves + colored clinical value regions.\n", calib_label))
   
   # 阈值概率 0.01~0.80（与连续净收益 / NIA / 贝叶斯DCA 口径统一；>0.80 临床意义有限）
@@ -1093,10 +1014,10 @@ plot_dca_curves <- function(model_name, use_calibrated = TRUE, file_suffix = "")
 }
 
 # ---------------------------------------------------------------
-# 5.7 连续净收益图（Continuous Net Benefit）
+# 5.5 连续净收益图（Continuous Net Benefit）
 # ---------------------------------------------------------------
 plot_continuous_nb <- function(model_name) {
-  cat("[10/11] 绘制连续净收益曲线...\n")
+  cat("[9/10] 绘制连续净收益曲线...\n")
   
   # 强制使用 dcurves 包：安装后再次 require 确认，仍失败则中止并提示手动安装
   if (!require("dcurves", quietly = TRUE)) {
@@ -1338,14 +1259,14 @@ plot_continuous_nb <- function(model_name) {
 }
 
 # ---------------------------------------------------------------
-# 5.7b 避免不必要干预数（Net Intervention Avoided, NIA）
+# 5.5b 避免不必要干预数（Net Intervention Avoided, NIA）
 # ---------------------------------------------------------------
 # Vickers & Elkin (2006): NIA(t) = 100 * (NB_model - NB_TreatAll) / (t/(1-t))
 # 表示在阈值 t 下，模型相对"全部治疗"策略每 100 名被治疗患者中
 # 避免的不必要干预数。保留负值区间：NIA < 0 表示模型劣于 Treat All（有害），
 # 图中以 y=0 参考线区分益（>0）/害（<0）区，不做截断以免掩盖有害区间。
 plot_net_intervention_avoided <- function(model_name) {
-  cat("[11/11] 绘制避免不必要干预数（NIA）曲线...\n")
+  cat("[10/10] 绘制避免不必要干预数（NIA）曲线...\n")
   
   thresholds <- seq(0.01, 0.80, by = 0.01)
   cohorts <- list(
@@ -1441,7 +1362,7 @@ plot_net_intervention_avoided <- function(model_name) {
 # =============================================================================
 main <- function() {
   cat("=", strrep("=", 76), "=\n", sep = "")
-  cat("  07_Clinical_Plots_R.R — SCI标准临床预测模型图表生成\n")
+  cat("  06_Clinical_Plots_R.R — SCI标准临床预测模型图表生成\n")
   cat("=", strrep("=", 76), "=\n", sep = "")
   
   # 读取推荐模型
@@ -1455,66 +1376,61 @@ main <- function() {
   cat(sprintf("Output dir: %s\n", OUTPUT_DIR))
   cat("\n")
   
-  # [1/11] 生长曲线
-  tryCatch(plot_growth_curve(model_name), error = function(e) {
-    cat("  ERROR in growth curve: ", e$message, "\n")
-  })
-  
-  # [2/11] 亚组森林图
+  # [1/10] 亚组森林图
   tryCatch(plot_subgroup_forest(model_name), error = function(e) {
     cat("  ERROR in subgroup forest plot: ", e$message, "\n")
   })
   
-  # [3/11] 风险分层点图
+  # [2/10] 风险分层点图
   tryCatch(plot_risk_stratification(), error = function(e) {
     cat("  ERROR in risk stratification: ", e$message, "\n")
   })
   
-  # [3.5/11] 临床影响曲线
+  # [2.5/10] 临床影响曲线
   tryCatch(plot_clinical_impact(model_name), error = function(e) {
     cat("  ERROR in clinical impact curve: ", e$message, "\n")
   })
   
-  # [4/11] 校准曲线（Raw 主图）
+  # [3/10] 校准曲线（Raw 主图）
   tryCatch(plot_calibration_curves(model_name, use_calibrated = FALSE, file_suffix = ""),
            error = function(e) {
     cat("  ERROR in calibration curves (raw): ", e$message, "\n")
   })
-  # [5/11] 校准曲线（Platt 补充图）
+  # [4/10] 校准曲线（Platt 补充图）
   tryCatch(plot_calibration_curves(model_name, use_calibrated = TRUE, file_suffix = ""),
            error = function(e) {
     cat("  ERROR in calibration curves (platt): ", e$message, "\n")
   })
-  # [6/11] 校准曲线（Intercept 补充图）
+  # [5/10] 校准曲线（Intercept 补充图）
   tryCatch(plot_calibration_curves(model_name, use_calibrated = TRUE,
                                    file_suffix = "_intercept_recalibrated"),
            error = function(e) {
     cat("  ERROR in calibration curves (intercept): ", e$message, "\n")
   })
   
-  # [7/11] 决策曲线 DCA（Raw 主图）
+  # [6/10] 决策曲线 DCA（Raw 主图）
   tryCatch(plot_dca_curves(model_name, use_calibrated = FALSE, file_suffix = ""),
            error = function(e) {
     cat("  ERROR in DCA curves (raw): ", e$message, "\n")
   })
-  # [8/11] 决策曲线 DCA（Platt 补充图）
+  # [7/10] 决策曲线 DCA（Platt 补充图）
   tryCatch(plot_dca_curves(model_name, use_calibrated = TRUE, file_suffix = ""),
            error = function(e) {
     cat("  ERROR in DCA curves (platt): ", e$message, "\n")
   })
-  # [9/11] 决策曲线 DCA（Intercept 补充图）
+  # [8/10] 决策曲线 DCA（Intercept 补充图）
   tryCatch(plot_dca_curves(model_name, use_calibrated = TRUE,
                            file_suffix = "_intercept_recalibrated"),
            error = function(e) {
     cat("  ERROR in DCA curves (intercept): ", e$message, "\n")
   })
   
-  # [10/11] 连续净收益曲线
+  # [9/10] 连续净收益曲线
   tryCatch(plot_continuous_nb(model_name), error = function(e) {
     cat("  ERROR in continuous net benefit: ", e$message, "\n")
   })
   
-  # [11/11] 避免不必要干预数（NIA）
+  # [10/10] 避免不必要干预数（NIA）
   tryCatch(plot_net_intervention_avoided(model_name), error = function(e) {
     cat("  ERROR in NIA curve: ", e$message, "\n")
   })
