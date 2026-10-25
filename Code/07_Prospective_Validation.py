@@ -277,6 +277,21 @@ def compute_metrics(y_true, y_prob, cutoff):
     calib_int = cm.intercept_[0]
     calib_slope = cm.coef_[0][0]
 
+    # Bootstrap 95% CI for Calibration Slope（与 05 同口径：1000 次、seed=123、百分位法）
+    rng = np.random.RandomState(RANDOM_STATE)
+    bs_slopes = np.empty(BOOTSTRAP_ITER)
+    for b in range(BOOTSTRAP_ITER):
+        idx = rng.choice(len(y_true), size=len(y_true), replace=True)
+        try:
+            cm_bs = LogisticRegression(penalty=None, solver="lbfgs", max_iter=5000)
+            cm_bs.fit(logit[idx].reshape(-1, 1), y_true[idx])
+            bs_slopes[b] = cm_bs.coef_[0][0]
+        except Exception:
+            bs_slopes[b] = np.nan
+    bs_slopes = bs_slopes[~np.isnan(bs_slopes)]
+    slope_ci_lo = np.percentile(bs_slopes, 2.5) if len(bs_slopes) > 0 else np.nan
+    slope_ci_hi = np.percentile(bs_slopes, 97.5) if len(bs_slopes) > 0 else np.nan
+
     return {
         "AUC": auc, "AUC_CI_Lower": auc_lo, "AUC_CI_Upper": auc_hi,
         "AUPRC": auprc, "AUPRC_CI_Lower": auprc_lo, "AUPRC_CI_Upper": auprc_hi,
@@ -288,6 +303,8 @@ def compute_metrics(y_true, y_prob, cutoff):
         "NPV": tn / (tn + fn) if (tn + fn) > 0 else 0.0,
         "F1": f1_score(y_true, y_pred, zero_division=0),
         "Calib_Intercept": calib_int, "Calib_Slope": calib_slope,
+        "Calib_Slope_CI_Lower": slope_ci_lo,
+        "Calib_Slope_CI_Upper": slope_ci_hi,
         "Cutoff": cutoff,
     }
 
@@ -608,7 +625,8 @@ print(f"  Prospective [{SET2_NAME}] : {_fmt(m_prosp_cal)}")
 for tag, m in [(SET1_NAME, m_prosp_raw), (SET2_NAME, m_prosp_cal)]:
     print(f"    [{tag}] clinical: Acc={m['Accuracy']:.3f}, Sens={m['Sensitivity']:.3f}, "
           f"Spec={m['Specificity']:.3f}, PPV={m['PPV']:.3f}, NPV={m['NPV']:.3f}, F1={m['F1']:.3f}")
-    print(f"    [{tag}] calib   : Intercept={m['Calib_Intercept']:.3f}, Slope={m['Calib_Slope']:.3f}")
+    print(f"    [{tag}] calib   : Intercept={m['Calib_Intercept']:.3f}, "
+          f"Slope={m['Calib_Slope']:.3f} ({m['Calib_Slope_CI_Lower']:.3f}-{m['Calib_Slope_CI_Upper']:.3f})")
 
 # HL tests
 hl_chi_raw, hl_dof_raw, hl_p_raw = hosmer_lemeshow_test(y_prosp, prosp_prob_raw, g=10)
@@ -887,7 +905,9 @@ lines.append(f"  Derivation apparent vs Prospective (before): diff={diff:.3f} ({
 lines.append("")
 lines.append(f"[Prospective — {SET2_NAME}]")
 lines.append(f"  Brier={m_prosp_cal['Brier']:.4f}; Calib Intercept={m_prosp_cal['Calib_Intercept']:.3f}, "
-             f"Slope={m_prosp_cal['Calib_Slope']:.3f}; HL chi2={hl_chi_cal:.3f}, p={hl_p_cal:.4f}")
+             f"Slope={m_prosp_cal['Calib_Slope']:.3f} "
+             f"({m_prosp_cal['Calib_Slope_CI_Lower']:.3f}-{m_prosp_cal['Calib_Slope_CI_Upper']:.3f}); "
+             f"HL chi2={hl_chi_cal:.3f}, p={hl_p_cal:.4f}")
 lines.append(f"  Acc={m_prosp_cal['Accuracy']:.3f}, Sens={m_prosp_cal['Sensitivity']:.3f}, "
              f"Spec={m_prosp_cal['Specificity']:.3f}, PPV={m_prosp_cal['PPV']:.3f}, "
              f"NPV={m_prosp_cal['NPV']:.3f}, F1={m_prosp_cal['F1']:.3f}")
