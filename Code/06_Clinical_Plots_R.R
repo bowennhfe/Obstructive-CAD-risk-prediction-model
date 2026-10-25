@@ -2,7 +2,7 @@
 # 06_Clinical_Plots_R.R — SCI标准临床预测模型图表生成（与Python风格一致）
 # =============================================================================
 # 功能：分 10 步生成临床图表，完全符合医学SCI顶刊出版要求：
-#   亚组森林图、风险分层点图、临床影响曲线、校准曲线、决策曲线（DCA）、
+#   亚组森林图、临床影响曲线、校准曲线、决策曲线（DCA）、
 #   连续净收益、避免不必要干预数（NIA）。
 #   其中校准曲线与 DCA 各含校准前/后双版本（各计 3 步）。
 # 输入：各CSV文件（来自 01~06 Python流程）
@@ -69,8 +69,7 @@ dir.create(OUTPUT_DIR, showWarnings = FALSE, recursive = TRUE)
 
 # 启动时校验关键输入 CSV 存在性（来自上游 01~06 流程），缺失即中止并给出明确路径
 required_inputs <- c(
-  file.path(MODEL_SEL_DIR, "model_selection_metrics.csv"),
-  file.path(MODEL_DEV_DIR, "risk_stratification_results.csv")
+  file.path(MODEL_SEL_DIR, "model_selection_metrics.csv")
 )
 missing_inputs <- required_inputs[!file.exists(required_inputs)]
 if (length(missing_inputs) > 0) {
@@ -326,137 +325,10 @@ plot_subgroup_forest <- function(model_name) {
 }
 
 # ---------------------------------------------------------------
-# 5.2 风险分层点图（Cleveland Dot Plot）
-# ---------------------------------------------------------------
-plot_risk_stratification <- function() {
-  cat("[2/10] 绘制风险分层点图...\n")
-  
-  data_path <- file.path(MODEL_DEV_DIR, "risk_stratification_results.csv")
-  if (!file.exists(data_path)) {
-    cat("  WARNING: risk_stratification_results.csv not found, skipping.\n")
-    return(NULL)
-  }
-  
-  df <- read.csv(data_path, stringsAsFactors = FALSE)
-  
-  # 计算 Wilson 95% CI
-  calc_wilson_ci <- function(x, n, conf.level = 0.95) {
-    if (n == 0) return(c(0, 0))
-    z <- qnorm((1 + conf.level) / 2)
-    p_hat <- x / n
-    denom <- 1 + z^2 / n
-    center <- (p_hat + z^2 / (2 * n)) / denom
-    margin <- z * sqrt((p_hat * (1 - p_hat) + z^2 / (4 * n)) / n) / denom
-    c(center - margin, center + margin)
-  }
-  
-  # 风险分层结果来自 Python 输出，仅含 Observed_Rate，通过 Observed_Rate * N 反推事件数
-  
-  # 文件列：Cohort,Risk_Group,N,Observed_Rate
-  # 通过 Observed_Rate * N 反推事件数，用于 Wilson CI
-  
-  df$Pos <- round(df$Observed_Rate * df$N)
-  ci_list <- lapply(1:nrow(df), function(i) {
-    calc_wilson_ci(df$Pos[i], df$N[i])
-  })
-  df$CI_Lower <- sapply(ci_list, `[`, 1)
-  df$CI_Upper <- sapply(ci_list, `[`, 2)
-  
-  # 动态风险水平顺序：从 CSV 元数据列或 Risk_Group 字符串中提取截断值排序
-  # 优先使用 Low_Cutoff / High_Cutoff 元数据列（由 Python 05 脚本写入）
-  if ("Low_Cutoff" %in% colnames(df) && "High_Cutoff" %in% colnames(df) &&
-      nrow(df) > 0) {
-    low_val <- df$Low_Cutoff[1]
-    high_val <- df$High_Cutoff[1]
-  } else {
-    # 回退：从 Risk_Group 字符串中解析数字（如 "Low (<0.12)" 提取 0.12）
-    parse_first_num <- function(s) {
-      m <- regmatches(s, regexpr("[0-9]+\\.?[0-9]*", s))
-      if (length(m) > 0) as.numeric(m[1]) else NA
-    }
-    nums <- sapply(df$Risk_Group, parse_first_num)
-    low_val <- min(nums, na.rm = TRUE)
-    high_val <- max(nums, na.rm = TRUE)
-  }
-
-  # 根据截断值构建标签及其顺序
-  low_label  <- sprintf("Low (<%.0f%%)", low_val * 100)
-  inter_label <- sprintf("Intermediate (%.0f%%-%.0f%%)", low_val * 100, high_val * 100)
-  high_label <- sprintf("High (%.0f%%)", high_val * 100)
-
-  # 匹配实际出现的 Risk_Group 值（可能因浮点精度与 sprintf 不精确一致）
-  # 改用模糊匹配：包含 "Low"、"Intermediate"、"High" 即可
-  group_levels <- c(
-    grep("Low", df$Risk_Group, value = TRUE)[1],
-    grep("Intermediate", df$Risk_Group, value = TRUE)[1],
-    grep("High", df$Risk_Group, value = TRUE)[1]
-  )
-  group_levels <- unique(na.omit(group_levels))
-  df$Risk_Group <- factor(df$Risk_Group, levels = group_levels)
-  
-  # 队列颜色（风险分层仅覆盖 Derivation / Temporal，地理集已按需求移除）
-  cohort_colors <- c("Derivation" = COL_DERIV, "Temporal" = COL_TEMP)
-  cohort_shapes <- c("Derivation" = 16, "Temporal" = 15)
-  
-  # Y 轴偏移
-  y_offset <- c("Derivation" = 0.18, "Temporal" = -0.18)
-  
-  df$y_pos <- as.numeric(df$Risk_Group) + y_offset[df$Cohort]
-  
-  # 计算 Derivation 总体患病率
-  deriv_total <- subset(df, Cohort == "Derivation")
-  deriv_overall_rate <- sum(deriv_total$Pos) / sum(deriv_total$N)
-  
-  p <- ggplot(df, aes(x = Observed_Rate * 100, y = y_pos)) +
-    # 队列间连接线
-    geom_line(aes(group = Risk_Group), color = "gray70", linewidth = 0.5, alpha = 0.5) +
-    # Wilson 误差线：geom_errorbarh 已于 ggplot2 4.0 弃用，改用 geom_linerange（同森林图）
-    geom_linerange(aes(xmin = CI_Lower * 100, xmax = CI_Upper * 100, color = Cohort),
-                   linewidth = 0.8, show.legend = FALSE) +
-    # 点
-    geom_point(aes(color = Cohort, shape = Cohort), size = 3.5, stroke = 0.8) +
-    # 标签
-    geom_text(aes(label = paste0(round(Observed_Rate * 100), "%"),
-                  color = Cohort),
-              hjust = -0.3, vjust = 0, size = 2.8, show.legend = FALSE) +
-    scale_color_manual(name = "Cohort", values = cohort_colors,
-                       breaks = names(cohort_colors), labels = names(cohort_colors)) +
-    scale_shape_manual(name = "Cohort", values = cohort_shapes,
-                       breaks = names(cohort_shapes), labels = names(cohort_shapes)) +
-    # 参考线：Derivation 总体患病率
-    geom_vline(xintercept = deriv_overall_rate * 100, linetype = "dashed",
-               color = "gray50", linewidth = 0.6) +
-    scale_y_continuous(breaks = 1:3, labels = levels(df$Risk_Group),
-                       limits = c(0.5, 3.5)) +
-    scale_x_continuous(limits = c(0, 100), labels = scales::label_number(suffix = "%")) +
-    labs(x = "Observed Event Rate (%)", y = "Risk Group") +
-    theme_bw(base_size = FONT_LABEL, base_family = "sans") +
-    theme(
-      plot.title = element_blank(),
-      axis.title = element_text(size = FONT_LABEL),
-      axis.text = element_text(size = FONT_TICK),
-      legend.position = auto_legend_pos(df$Observed_Rate * 100, df$y_pos),
-      legend.justification = c(0.5, 0.5),
-      legend.background = element_rect(fill = "white", color = "gray80"),
-      legend.title = element_text(size = FONT_LEGEND),
-      legend.text = element_text(size = FONT_LEGEND - 1),
-      panel.grid.minor = element_blank(),
-      panel.grid.major = element_line(linewidth = 0.3),
-      panel.border = element_blank(),
-      axis.line = element_line(color = "black", linewidth = 0.5)
-    )
-  
-  save_sci_plot(p, "Risk_Stratification_Dotplot",
-                width = 7.0, height = 4.5, dpi_type = "line")
-  cat("  Risk stratification dot plot done.\n")
-  return(p)
-}
-
-# ---------------------------------------------------------------
 # 5.2b 临床影响曲线（Clinical Impact Curve）
 # ---------------------------------------------------------------
 plot_clinical_impact <- function(model_name) {
-  cat("[2.5/10] 绘制临床影响曲线...\n")
+  cat("[2/10] 绘制临床影响曲线...\n")
 
   # 读取三个队列的预测概率（来自 05_Model_Development 输出）
   cohorts <- list(
@@ -1381,12 +1253,7 @@ main <- function() {
     cat("  ERROR in subgroup forest plot: ", e$message, "\n")
   })
   
-  # [2/10] 风险分层点图
-  tryCatch(plot_risk_stratification(), error = function(e) {
-    cat("  ERROR in risk stratification: ", e$message, "\n")
-  })
-  
-  # [2.5/10] 临床影响曲线
+  # [2/10] 临床影响曲线
   tryCatch(plot_clinical_impact(model_name), error = function(e) {
     cat("  ERROR in clinical impact curve: ", e$message, "\n")
   })

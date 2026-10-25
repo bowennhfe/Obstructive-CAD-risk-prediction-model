@@ -22,10 +22,10 @@
 #   - calibration 模式 → Prospective Validation/R_outputs/
 #   - merge 模式       → Prospective Validation/R_outputs_Temporal_Merged/
 #   - 表格：Prospective_Validation_Summary.csv, Prospective_HosmerLemeshow.csv,
-#           Prospective_Cutoff_Sensitivity.csv, Prospective_Risk_Stratification.csv
+#           Prospective_Cutoff_Sensitivity.csv,
 #   - 图（各 TIFF+PDF+PNG）：Prospective_ROC_AUPRC_*（ROC + PR 双图，merge 模式含两条曲线）,
 #           Prospective_Calibration_Curves_*, Prospective_DCA_Curves_*,
-#           Prospective_ConfusionMatrix*, Prospective_RiskStratification*,
+#           Prospective_ConfusionMatrix*,
 #           Prospective_Probability_Distribution_*,
 #           Prospective_Comparison_*（两套结果对比拼图：校准曲线 + 决策曲线）
 #   - 报告：Prospective_Report.txt
@@ -324,23 +324,6 @@ write.csv(data.frame(
   Specificity = c(cm_raw$Spec, cm_sc_raw$Spec, cm_cal$Spec, cm_sc_cal$Spec)
 ), file.path(OUTPUT_DIR, "Prospective_Cutoff_Sensitivity.csv"), row.names = FALSE)
 
-# 风险分层（Derivation 三分位；两套）
-risk_table <- function(y, p, low_cut, high_cut) {
-  grp <- factor(ifelse(p < low_cut, "Low", ifelse(p < high_cut, "Intermediate", "High")),
-                levels = c("Low", "Intermediate", "High"))
-  data.frame(Risk_Group = levels(grp),
-             N = as.integer(table(grp)),
-             Events = as.integer(tapply(y, grp, sum)),
-             Event_Rate = as.numeric(tapply(y, grp, mean)),
-             Mean_Probability = as.numeric(tapply(p, grp, mean)))
-}
-risk_raw <- risk_table(y, p_raw, quantile(p_d, 1/3), quantile(p_d, 2/3))
-risk_cal <- risk_table(y, p_cal_vals, quantile(p_d_cal_vals, 1/3), quantile(p_d_cal_vals, 2/3))
-risk_out <- rbind(cbind(Calibration = STATUS_A, risk_raw),
-                  cbind(Calibration = STATUS_B, risk_cal))
-write.csv(risk_out, file.path(OUTPUT_DIR, "Prospective_Risk_Stratification.csv"), row.names = FALSE)
-cat("\n--- Risk stratification (calibrated) ---\n"); print(risk_cal)
-
 # =============================================================================
 # --- 7. 绘图（Raw 与 Recalibrated 各一套；参照 06/07 风格） ---
 # =============================================================================
@@ -378,7 +361,7 @@ p_roc <- ggplot(roc_df, aes(fpr, tpr, color = Curve)) +
         legend.position = c(0.98, 0.02), legend.justification = c(1, 0),
         legend.text = element_text(size = FONT_LEGEND - 2),
         legend.key.height = unit(16, "pt"))
-cat("[1/7] ROC built (AUC).\n")
+cat("[1/6] ROC built (AUC).\n")
 
 # ---- 7.2 校准曲线（07 风格：分位数分箱 + 局部合并），Raw 与 Calibrated 各一张 ----
 make_cal_bins <- function(y, p) {
@@ -420,7 +403,7 @@ plot_calibration <- function(y, p, hl_p, base_name) {
 }
 plot_calibration(y, p_raw, hl_raw["p"], paste0("Prospective_Calibration_Curves", SFX_A, "_", model_name))
 plot_calibration(y, p_cal_vals, hl_cal["p"], paste0("Prospective_Calibration_Curves", SFX_B, "_", model_name))
-cat("[2/7] Calibration curves (set 1 + set 2) done.\n")
+cat("[2/6] Calibration curves (set 1 + set 2) done.\n")
 
 # ---- 7.3 DCA（07 风格），Raw 与 Calibrated 各一张 ----
 nb_curve <- function(y, p, thr) {
@@ -458,7 +441,7 @@ plot_dca <- function(y, p, base_name) {
 }
 plot_dca(y, p_raw, paste0("Prospective_DCA_Curves", SFX_A, "_", model_name))
 plot_dca(y, p_cal_vals, paste0("Prospective_DCA_Curves", SFX_B, "_", model_name))
-cat("[3/7] DCA curves (set 1 + set 2) done.\n")
+cat("[3/6] DCA curves (set 1 + set 2) done.\n")
 
 # ---- 7.4 混淆矩阵（Raw 与 Calibrated 各一张） ----
 plot_cm <- function(y, p, cutoff, base_name) {
@@ -478,25 +461,9 @@ plot_cm <- function(y, p, cutoff, base_name) {
 }
 plot_cm(y, p_raw, cutoff_raw, paste0("Prospective_ConfusionMatrix", SFX_A))
 plot_cm(y, p_cal_vals, cutoff_cal, paste0("Prospective_ConfusionMatrix", SFX_B))
-cat("[4/7] Confusion matrices (raw + calibrated) done.\n")
+cat("[4/6] Confusion matrices (raw + calibrated) done.\n")
 
-# ---- 7.5 风险分层（Raw 与 Calibrated 各一张；参照 06 风格） ----
-plot_risk <- function(rt, base_name) {
-  rt$Risk_Group <- factor(rt$Risk_Group, levels = c("Low", "Intermediate", "High"))
-  pr <- ggplot(rt, aes(Risk_Group, Event_Rate, fill = Risk_Group)) +
-    geom_col(width = 0.62, alpha = 0.9, color = "gray30") +
-    geom_text(aes(label = sprintf("%.1f%%\n(n=%d)", Event_Rate * 100, N)), vjust = -0.25, size = 3.4) +
-    scale_fill_manual(values = c("Low" = COL_GEO, "Intermediate" = COL_TEMP, "High" = COL_RED)) +
-    scale_y_continuous(limits = c(0, max(rt$Event_Rate) * 1.35 + 0.03), labels = scales::label_percent(accuracy = 1)) +
-    labs(x = NULL, y = "Observed Event Rate") +
-    theme_sci() + theme(legend.position = "none")
-  save_sci_plot(pr, base_name, 6.5, 5.0, "color")
-}
-plot_risk(risk_raw, paste0("Prospective_RiskStratification", SFX_A))
-plot_risk(risk_cal, paste0("Prospective_RiskStratification", SFX_B))
-cat("[5/7] Risk stratification (raw + calibrated) done.\n")
-
-# ---- 7.6 PR 曲线（merge 模式：两条曲线；calibration 模式：单条；与 ROC 融合为双图） ----
+# ---- 7.5 PR 曲线（merge 模式：两条曲线；calibration 模式：单条；与 ROC 融合为双图） ----
 pr_coords <- function(y, p) {
   o <- order(p, decreasing = TRUE); ys <- y[o]
   tps <- cumsum(ys); fps <- cumsum(1 - ys)
@@ -532,7 +499,7 @@ p_pr <- p_pr +
 # ---- 7.6b ROC (AUC) + PR (AUPRC) 融合为双图 ----
 disc <- p_roc + p_pr
 save_sci_plot(disc, paste0("Prospective_ROC_AUPRC_", model_name), 9.5, 5.5, "color")
-cat("[6/7] ROC + PR (AUC + AUPRC) combined figure done.\n")
+cat("[5/6] ROC + PR (AUC + AUPRC) combined figure done.\n")
 
 # ---- 7.7 概率分布（Raw 与 Calibrated 各一张） ----
 plot_dist <- function(y, p, cutoff, base_name) {
@@ -547,7 +514,7 @@ plot_dist <- function(y, p, cutoff, base_name) {
 }
 plot_dist(y, p_raw, cutoff_raw, paste0("Prospective_Probability_Distribution", SFX_A))
 plot_dist(y, p_cal_vals, cutoff_cal, paste0("Prospective_Probability_Distribution", SFX_B))
-cat("[7/7] Probability distribution (raw + calibrated) done.\n")
+cat("[6/6] Probability distribution (raw + calibrated) done.\n")
 
 # ---- 7.8 两套结果对比拼图（校准曲线 + 决策曲线） ----
 cat(sprintf("[7b] Comparison composite (%s)...\n", COMP_TITLE))
@@ -656,10 +623,6 @@ rep_lines <- c(
   sprintf("  Calib slope=%.3f, intercept=%.3f | HL chi2=%.3f, p=%.4f",
           m_cal$Calib_Slope, m_cal$Calib_Intercept, m_cal$HL_chi2, m_cal$HL_p),
   sprintf("  Delta AUC=%.4f, Delta AUPRC=%.4f (Set 2 - Set 1)", m_cal$AUC - m_raw$AUC, m_cal$AUPRC - m_raw$AUPRC),
-  "",
-  sprintf("[Risk stratification — %s]", STATUS_B),
-  apply(risk_cal, 1, function(r) sprintf("  %-14s n=%s events=%s rate=%.1f%%",
-                                         r["Risk_Group"], r["N"], r["Events"], as.numeric(r["Event_Rate"]) * 100)),
   "",
   sprintf("Outputs: %s", OUTPUT_DIR),
   "======================================================================"

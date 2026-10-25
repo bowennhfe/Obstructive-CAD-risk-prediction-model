@@ -18,7 +18,7 @@
 # 输出：
 #   - E:\new\Model Development（Part 1）：final_model_summary.csv,
 #     predicted_probabilities_*.csv, auc_comparison_results.csv,
-#     hosmer_lemeshow_results.csv, risk_stratification_results.csv,
+#     hosmer_lemeshow_results.csv,
 #     以及 ROC/校准曲线/DCA/SHAP 等图（PNG+PDF+TIF, DPI=600）
 #   - E:\new\Subgroup Analysis（Part 2）：Subgroup_Performance_{model}.csv,
 #     Subgroup_Calibration_Comparison.csv, subgroup_brier_lollipop.*
@@ -1581,74 +1581,6 @@ def plot_brier_skill_score(metrics_dict, preds_dict, model_name, result_dir):
 
 
 # =============================================================================
-# Risk Stratification: NPV/PPV dynamic threshold-based risk grouping
-# =============================================================================
-def compute_risk_stratification(preds_dict, result_dir, low_cutoff=0.05, high_cutoff=0.20):
-    """Risk stratification based on data-driven NPV/PPV dual-cutoff method.
-
-    Thresholds are derived from Derivation OOF predictions:
-      Low cutoff:  max threshold with NPV >= 0.95 (miss rate < 5%)
-      High cutoff: min threshold with PPV >= 0.60 (intervention precision >= 60%)
-    Outputs risk_stratification_results.csv with threshold-annotated group names.
-    """
-    # Step 1: Use passed-in thresholds (computed dynamically from OOF NPV/PPV)
-    print(f"\n  Risk Stratification Cutoffs (NPV/PPV Dynamic Strategy):")
-    print(f"    Low cutoff  (NPV>=0.95): {low_cutoff:.4f}")
-    print(f"    High cutoff (PPV>=0.60): {high_cutoff:.4f}")
-
-    # Build dynamic labels
-    low_label = f"Low (<{low_cutoff:.0%})"
-    inter_label = f"Intermediate ({low_cutoff:.0%}-{high_cutoff:.0%})"
-    high_label = f"High (>{high_cutoff:.0%})"
-
-    # Step 2 & 3: Apply to all cohorts and compute statistics
-    # 注：地理（Geographical）队列的风险分层已按需求移除，仅保留 Derivation / Temporal。
-    rows = []
-    cohort_order = ["Derivation", "Temporal"]
-    for cohort in cohort_order:
-        if cohort not in preds_dict:
-            continue
-        y_true, y_prob = preds_dict[cohort]
-
-        # Assign risk groups with dynamic threshold-annotated labels
-        risk_group = np.where(
-            y_prob < low_cutoff, low_label,
-            np.where(y_prob < high_cutoff, inter_label, high_label)
-        )
-
-        for rg in [low_label, inter_label, high_label]:
-            mask = risk_group == rg
-            n = np.sum(mask)
-            events = np.sum(y_true[mask])
-            obs_rate = events / n if n > 0 else 0.0
-            rows.append({
-                "Cohort": cohort,
-                "Risk_Group": rg,
-                "N": int(n),
-                "Observed_Rate": round(obs_rate, 4),
-            })
-
-    # Step 4: Save CSV（两个 cutoff 作为元数据列一并写入，便于结果可追溯）
-    df = pd.DataFrame(rows)
-    df["Low_Cutoff"] = round(low_cutoff, 4)
-    df["High_Cutoff"] = round(high_cutoff, 4)
-    csv_path = os.path.join(result_dir, "risk_stratification_results.csv")
-    df.to_csv(csv_path, index=False, float_format='%.4f')
-    print(f"  Risk stratification saved: {csv_path}")
-
-    # Quality check
-    for cohort in cohort_order:
-        if cohort not in preds_dict:
-            continue
-        sub = df[df["Cohort"] == cohort]
-        rates = sub["Observed_Rate"].values
-        if not (rates[0] < rates[1] < rates[2]):
-            print(f"  WARNING: {cohort} Observed_Rate not monotonic: {rates}")
-
-    return df, low_cutoff, high_cutoff
-
-
-# =============================================================================
 # Individual SHAP Force (Waterfall) — 2 cases (lowest / highest predicted probability)
 # =============================================================================
 def plot_individual_shap_force(clf, X_train, feature_names, model_name,
@@ -2520,113 +2452,6 @@ hl_df = pd.DataFrame(hl_rows)
 hl_csv = os.path.join(RESULT_DIR, "hosmer_lemeshow_results.csv")
 hl_df.to_csv(hl_csv, index=False, float_format='%.6f')
 
-# --- Risk Stratification ---
-print("\n=== Risk Stratification ===")
-
-# ========== NPV/PPV 动态阈值计算（基于 Derivation OOF 预测） ==========
-# 原理：从 Derivation 队列 OOF 预测中计算 NPV 和 PPV 随阈值变化的曲线，
-#       选择满足临床要求的最优截断点。
-# 低危阈值：NPV >= 0.95 的最大阈值（确保漏诊率 < 5%）
-# 高危阈值：PPV >= 0.60 的最小阈值（确保干预者中 >= 60% 为真阳性）
-low_cut_dynamic = 0.05  # fallback default
-high_cut_dynamic = 0.20  # fallback default
-
-if oof_preds_auc is not None:
-    y_der_oot, prob_der_oot = oof_preds_auc
-    # 阈值搜索范围及步长
-    thr_grid = np.arange(0.01, 0.80, 0.005)
-    n_thr = len(thr_grid)
-
-    npv_arr = np.zeros(n_thr)
-    ppv_arr = np.zeros(n_thr)
-
-    for i, thr in enumerate(thr_grid):
-        pred_pos = prob_der_oot >= thr
-        pred_neg = prob_der_oot < thr
-
-        tn = np.sum((pred_neg) & (y_der_oot == 0))
-        fn = np.sum((pred_neg) & (y_der_oot == 1))
-        tp = np.sum((pred_pos) & (y_der_oot == 1))
-        fp = np.sum((pred_pos) & (y_der_oot == 0))
-
-        npv_arr[i] = tn / (tn + fn) if (tn + fn) > 0 else 0.0
-        ppv_arr[i] = tp / (tp + fp) if (tp + fp) > 0 else 0.0
-
-    # 低危阈值：NPV >= 0.95 的最大阈值
-    npv_ok = npv_arr >= 0.95
-    if np.any(npv_ok):
-        low_cut_dynamic = thr_grid[npv_ok][-1]  # 最大满足阈值的阈值
-    else:
-        low_cut_dynamic = 0.05
-        print("  WARNING: No threshold satisfies NPV >= 0.95, falling back to 0.05.")
-
-    # 高危阈值：PPV >= 0.60 的最小阈值
-    ppv_ok = ppv_arr >= 0.60
-    if np.any(ppv_ok):
-        high_cut_dynamic = thr_grid[ppv_ok][0]  # 最小满足阈值的阈值
-    else:
-        high_cut_dynamic = 0.20
-        print("  WARNING: No threshold satisfies PPV >= 0.60, falling back to 0.20.")
-
-    # 确保 low_cut < high_cut
-    if low_cut_dynamic >= high_cut_dynamic:
-        print(f"  WARNING: low_cut ({low_cut_dynamic:.4f}) >= high_cut ({high_cut_dynamic:.4f}), "
-              f"adjusting high_cut to low_cut + 0.05.")
-        high_cut_dynamic = low_cut_dynamic + 0.05
-
-    print(f"\n  >>> Dynamic NPV/PPV thresholds:")
-    print(f"      Low cutoff  (NPV>=0.95): {low_cut_dynamic:.4f}")
-    print(f"      High cutoff (PPV>=0.60): {high_cut_dynamic:.4f}")
-
-    # ---- NPV/PPV vs Threshold 曲线图 ----
-    fig, ax1 = plt.subplots(figsize=(8, 5))
-    color_npv = "#1f77b4"
-    color_ppv = "#d62728"
-
-    ax1.plot(thr_grid, npv_arr, color=color_npv, linewidth=2.0, label="NPV")
-    ax1.plot(thr_grid, ppv_arr, color=color_ppv, linewidth=2.0, label="PPV")
-    ax1.axhline(y=0.95, color=color_npv, linestyle="--", linewidth=0.8, alpha=0.5)
-    ax1.axhline(y=0.60, color=color_ppv, linestyle="--", linewidth=0.8, alpha=0.5)
-
-    # 标记截断点
-    ax1.axvline(x=low_cut_dynamic, color=color_npv, linestyle=":", linewidth=1.0)
-    ax1.axvline(x=high_cut_dynamic, color=color_ppv, linestyle=":", linewidth=1.0)
-
-    # 截断点处添加标注
-    low_npv = npv_arr[thr_grid == low_cut_dynamic][0] if low_cut_dynamic in thr_grid else np.interp(low_cut_dynamic, thr_grid, npv_arr)
-    high_ppv = ppv_arr[thr_grid == high_cut_dynamic][0] if high_cut_dynamic in thr_grid else np.interp(high_cut_dynamic, thr_grid, ppv_arr)
-    ax1.annotate(f"Low cutoff: {low_cut_dynamic:.3f}\nNPV={low_npv:.3f}",
-                 xy=(low_cut_dynamic, low_npv),
-                 xytext=(low_cut_dynamic + 0.08, low_npv - 0.10),
-                 arrowprops=dict(arrowstyle="->", color=color_npv),
-                 fontsize=10, color=color_npv, fontweight="bold")
-    ax1.annotate(f"High cutoff: {high_cut_dynamic:.3f}\nPPV={high_ppv:.3f}",
-                 xy=(high_cut_dynamic, high_ppv),
-                 xytext=(high_cut_dynamic + 0.08, high_ppv + 0.10),
-                 arrowprops=dict(arrowstyle="->", color=color_ppv),
-                 fontsize=10, color=color_ppv, fontweight="bold")
-
-    ax1.set_xlabel("Probability Threshold", fontsize=12)
-    ax1.set_ylabel("NPV / PPV", fontsize=12)
-    ax1.set_title(f"NPV & PPV vs Threshold — {model_name} (Derivation OOF)", fontsize=13, fontweight="bold")
-    ax1.set_xlim(0, 0.80)
-    ax1.set_ylim(0, 1.05)
-    ax1.legend(loc="best", fontsize=10)
-    ax1.grid(True, alpha=0.3)
-
-    fig.tight_layout()
-    save_figure(fig, f"NPV_PPV_Cutoff_Selection_{model_name}", RESULT_DIR)
-    plt.close(fig)
-    print(f"  NPV/PPV Cutoff Selection plot saved.")
-else:
-    print(f"  WARNING: OOF predictions not available for Derivation, "
-          f"using fallback thresholds (low={low_cut_dynamic:.4f}, high={high_cut_dynamic:.4f}).")
-
-# cutoff 已作为元数据列写入 CSV，返回值此处不再使用，解包为 _
-_, _, _ = compute_risk_stratification(preds_dict, RESULT_DIR,
-                                       low_cutoff=low_cut_dynamic,
-                                       high_cutoff=high_cut_dynamic)
-
 # Individual SHAP Waterfall (2 representative cases: lowest / highest probability)
 print("\n[Individual SHAP] Waterfall plots for 2 representative cases...")
 try:
@@ -2764,8 +2589,6 @@ try:
     plot_brier_skill_score(metrics_dict, preds_dict, model_name, RESULT_DIR)
 except Exception as e:
     print(f"  ERROR: {e}")
-
-# Supplementary: Risk Stratification Dot Plot (Removed per user request — generated by 06_Clinical_Plots_R.R)
 
 # --- Text Report ---
 print("\n=== Generating Text Report ===")

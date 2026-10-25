@@ -12,7 +12,7 @@
 #        [merge]             (a) Before retraining —— Derivation-only 模型；
 #                            (b) After retraining  —— 并入 Temporal 重训后的模型（model revision）。
 #      用法：python 07_Prospective_Validation.py [--model X] [--temporal-mode calibration|merge]
-#   4. 输出全部判别/校准/临床指标（Bootstrap 95% CI、Hosmer-Lemeshow、DCA、风险分层）；
+#   4. 输出全部判别/校准/临床指标（Bootstrap 95% CI、Hosmer-Lemeshow、DCA）；
 #      校准曲线与决策曲线沿用既有脚本（05 / 06）的绘图风格。
 #
 # 输入：
@@ -23,9 +23,9 @@
 # 输出（E:\new\Prospective Validation\）：
 #   - 表格：prospective_validation_summary.csv, prospective_table1_baseline.csv,
 #           prospective_hosmer_lemeshow.csv, prospective_cutoff_sensitivity.csv,
-#           prospective_risk_stratification.csv, prospective_predictions.csv,
+#           prospective_predictions.csv,
 #           prospective_auc_comparison.csv, prospective_calibrator.csv
-#   - 图：ROC, 校准曲线, DCA, 混淆矩阵, PR曲线, 风险分层, 概率分布 (PNG+PDF+TIF, 600dpi)
+#   - 图：ROC, 校准曲线, DCA, 混淆矩阵, PR曲线, 概率分布 (PNG+PDF+TIF, 600dpi)
 #   - 报告：prospective_report.txt
 # =============================================================================
 
@@ -685,26 +685,6 @@ pd.DataFrame([
 ]).to_csv(os.path.join(RESULT_DIR, "prospective_cutoff_sensitivity.csv"),
           index=False, float_format="%.6f")
 
-# --- Risk stratification (tertiles from Derivation probabilities of the same set) ---
-low_cut = np.percentile(der_prob_cal, 33.333)
-high_cut = np.percentile(der_prob_cal, 66.667)
-risk = np.where(prosp_prob_cal < low_cut, "Low",
-                np.where(prosp_prob_cal < high_cut, "Intermediate", "High"))
-risk_order = ["Low", "Intermediate", "High"]
-risk_rows = []
-for gname in risk_order:
-    mask = risk == gname
-    n_g = int(mask.sum())
-    ev = int(np.sum(y_prosp[mask] == 1))
-    risk_rows.append({"Risk_Group": gname, "N": n_g, "Events": ev,
-                      "Event_Rate": (ev / n_g) if n_g else np.nan,
-                      "Mean_Probability": float(prosp_prob_cal[mask].mean()) if n_g else np.nan})
-risk_df = pd.DataFrame(risk_rows)
-risk_df.to_csv(os.path.join(RESULT_DIR, "prospective_risk_stratification.csv"),
-               index=False, float_format="%.4f")
-print("\n  Risk stratification (recalibrated):")
-print(risk_df.to_string(index=False))
-
 # --- Summary table (仅前瞻、第二套结果) ---
 def _row(cohort, status, n, events, m, auc_est):
     r = {"Cohort": cohort, "Model": model_name, "Calibration_Status": status,
@@ -757,7 +737,6 @@ pred_cols = {
     "probsp_raw": prosp_prob_raw,
     "probsp_recalibrated": prosp_prob_cal,
     "predicted_class": (prosp_prob_cal >= final_cutoff_cal).astype(int),
-    "risk_group": risk,
 }
 if TEMPORAL_MODE == "merge":
     pred_cols["probsp_retrained"] = prosp_prob_cal   # 并入 Temporal 后重训模型的概率
@@ -807,7 +786,7 @@ ax.set_title(f"ROC Curve — Prospective Validation ({model_name})")
 ax.legend(loc="lower right", fontsize=8)
 ax.grid(alpha=0.3)
 save_figure(fig, "prosp_roc")
-print("  [1/7] ROC saved")
+print("  [1/6] ROC saved")
 
 # (2) Calibration — 第二套结果（参考 05 风格）
 cal_curves = [
@@ -816,7 +795,7 @@ cal_curves = [
 ]
 fig = plot_calibration_reference(cal_curves, f"Prospective ({model_name})")
 save_figure(fig, "prosp_calibration")
-print("  [2/7] Calibration saved")
+print("  [2/6] Calibration saved")
 
 # (3) DCA — 第二套结果（参考 07 风格）
 prev_prosp = float(np.mean(y_prosp))
@@ -825,7 +804,7 @@ dca_curves = [
 ]
 fig = plot_dca_reference(dca_curves, prev_prosp, f"Prospective ({model_name})", primary_idx=0)
 save_figure(fig, "prosp_dca")
-print("  [3/7] DCA saved")
+print("  [3/6] DCA saved")
 
 # (4) Confusion matrix — 仅校准后
 fig, ax = plt.subplots(figsize=(5.5, 5))
@@ -840,7 +819,7 @@ ax.set_yticks([0, 1]); ax.set_yticklabels(["True Neg", "True Pos"])
 ax.set_title(f"Confusion Matrix — Prospective ({SET2_TAG})\n(cutoff={final_cutoff_cal:.3f})")
 fig.colorbar(im, ax=ax, shrink=0.8)
 save_figure(fig, "prosp_confusion_matrix")
-print("  [4/7] Confusion matrix saved")
+print("  [4/6] Confusion matrix saved")
 
 # (5) PR curve（merge 模式下同时画重训前后两条曲线）
 fig, ax = plt.subplots(figsize=(6.5, 5.5))
@@ -856,25 +835,9 @@ ax.set_title(f"Precision-Recall Curve — Prospective ({model_name})")
 ax.legend(loc="upper right", fontsize=8)
 ax.grid(alpha=0.3)
 save_figure(fig, "prosp_pr_curve")
-print("  [5/7] PR curve saved")
+print("  [5/6] PR curve saved")
 
-# (6) Risk stratification (recalibrated)
-fig, ax = plt.subplots(figsize=(7, 5.5))
-xpos = np.arange(len(risk_order))
-vals = [risk_df.loc[risk_df["Risk_Group"] == g, "Event_Rate"].values[0] for g in risk_order]
-ns = [int(risk_df.loc[risk_df["Risk_Group"] == g, "N"].values[0]) for g in risk_order]
-ax.bar(xpos, vals, color=["#2ca02c", "#ff7f0e", "#d62728"], width=0.6, alpha=0.85)
-for i, (v, n) in enumerate(zip(vals, ns)):
-    ax.text(i, v + 0.01, f"{v*100:.1f}%\n(n={n})", ha="center", va="bottom", fontsize=10, fontweight="bold")
-ax.set_xticks(xpos); ax.set_xticklabels(risk_order)
-ax.set_ylabel("Observed Event Rate", fontweight="bold")
-ax.set_ylim(0, max(vals) * 1.3 + 0.05)
-ax.set_title(f"Risk Stratification — Prospective ({SET2_TAG})")
-ax.grid(alpha=0.3, axis="y")
-save_figure(fig, "prosp_risk_stratification")
-print("  [6/7] Risk stratification saved")
-
-# (7) Probability distribution — 仅校准后
+# (6) Probability distribution — 仅校准后
 fig, ax = plt.subplots(figsize=(7, 5.5))
 ax.hist(prosp_prob_cal[y_prosp == 0], bins=20, alpha=0.6, color="#1f77b4", label="No Event", density=True)
 ax.hist(prosp_prob_cal[y_prosp == 1], bins=20, alpha=0.6, color="#d62728", label="Event", density=True)
@@ -885,7 +848,7 @@ ax.set_title(f"Predicted Probability Distribution — Prospective ({SET2_TAG})")
 ax.legend(loc="upper center", fontsize=9)
 ax.grid(alpha=0.3, axis="y")
 save_figure(fig, "prosp_probability_distribution")
-print("  [7/7] Probability distribution saved")
+print("  [6/6] Probability distribution saved")
 
 # =============================================================================
 # Text report
@@ -928,10 +891,6 @@ lines.append(f"  Brier={m_prosp_cal['Brier']:.4f}; Calib Intercept={m_prosp_cal[
 lines.append(f"  Acc={m_prosp_cal['Accuracy']:.3f}, Sens={m_prosp_cal['Sensitivity']:.3f}, "
              f"Spec={m_prosp_cal['Specificity']:.3f}, PPV={m_prosp_cal['PPV']:.3f}, "
              f"NPV={m_prosp_cal['NPV']:.3f}, F1={m_prosp_cal['F1']:.3f}")
-lines.append("")
-lines.append("[Risk stratification — recalibrated]")
-for _, r in risk_df.iterrows():
-    lines.append(f"  {r['Risk_Group']:14s} n={int(r['N']):3d}  events={int(r['Events']):3d}  rate={r['Event_Rate']*100:.1f}%")
 lines.append("")
 lines.append("Outputs saved to: " + RESULT_DIR)
 lines.append("=" * 70)
