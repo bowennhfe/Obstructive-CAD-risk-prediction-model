@@ -20,8 +20,37 @@ BASE_DIR <- dirname(script_dir)  # parent of Code/
 INPUT_DIR <- file.path(BASE_DIR, "vif_analysis")        # input from 02_vif_analysis
 OUTPUT_DIR <- file.path(BASE_DIR, "feature_selection")   # output for 03_feature_selection
 
+# ===================== CLI Bridge Mode（供 04_Model_Selection.py 折内重放调用） =====================
+# 用法：Rscript 03_feature_selection.R <input.csv> <output_features.txt>
+# 无参数时保持原有行为完全不变；带 2 个及以上参数时进入桥接模式：
+#   - 从 <input.csv> 读取数据（替代 vif_analysis/Derivation cohort.csv）
+#   - 工作目录切换到 <output_features.txt> 所在目录（所有中间产物写入该目录）
+#   - 关闭绘图输出、跳过第 9 节（验证队列改写），仅执行 4 方法共识特征选择
+#   - 最终共识特征（每行一个）写入 <output_features.txt>
+bridge_args <- commandArgs(trailingOnly = TRUE)
+BRIDGE_MODE <- length(bridge_args) >= 2
+PLOTS_ENABLED <- TRUE
+if (BRIDGE_MODE) {
+  BRIDGE_INPUT <- normalizePath(bridge_args[1], mustWork = TRUE)
+  # normalizePath 对"尚不存在"的输出文件在 Windows 下可能报错，故只规范化其
+  # 所在目录（调用方已事先创建），再拼接文件名，保证跨平台稳妥。
+  bridge_out_dir <- normalizePath(dirname(bridge_args[2]), mustWork = TRUE)
+  BRIDGE_OUTPUT <- file.path(bridge_out_dir, basename(bridge_args[2]))
+  PLOTS_ENABLED <- FALSE
+  cat("BRIDGE_MODE: TRUE\n")
+  cat("BRIDGE_INPUT: ", BRIDGE_INPUT, "\n", sep = "")
+  cat("BRIDGE_OUTPUT: ", BRIDGE_OUTPUT, "\n", sep = "")
+}
+
 if (!dir.exists(OUTPUT_DIR)) {
   dir.create(OUTPUT_DIR, recursive = TRUE)
+}
+
+if (BRIDGE_MODE) {
+  OUTPUT_DIR <- dirname(BRIDGE_OUTPUT)
+  if (!dir.exists(OUTPUT_DIR)) {
+    dir.create(OUTPUT_DIR, recursive = TRUE)
+  }
 }
 
 cat("BASE_DIR:  ", BASE_DIR, "\n")
@@ -61,7 +90,8 @@ library(mRMRe)             # mRMR 过滤法特征选择
 options(bitmapType = "cairo")
 
 # ===================== 1. Data Loading =====================
-data <- read.csv(file.path(INPUT_DIR, "Derivation cohort.csv"), header = TRUE)
+data <- read.csv(if (BRIDGE_MODE) BRIDGE_INPUT else file.path(INPUT_DIR, "Derivation cohort.csv"),
+                 header = TRUE)
 print(str(data))
 
 id_col <- which(colnames(data) == "ID")
@@ -117,6 +147,7 @@ feature_order <- data_long %>%
 
 # Unified output helper: PDF (pdf+sans), PNG, TIFF (both png/tiff use sans)
 save_plot_triple <- function(plot_obj, pdf_name, png_name, tif_name) {
+  if (!PLOTS_ENABLED) return(invisible(NULL))
   # PDF via pdf() device with sans font family
   pdf(pdf_name, width = 10, height = 8, family = "sans")
   print(plot_obj)
@@ -211,8 +242,8 @@ LASSO_freq <- LASSO_freq_full / n_LASSO_reps
 LASSO_freq_sorted <- sort(LASSO_freq, decreasing = TRUE)
 print(head(LASSO_freq_sorted, 10))
 
-# ========== Optimize LASSO stability threshold via nested CV ==========
-print("\nOptimizing LASSO stability threshold via nested CV...")
+# ========== Optimize LASSO stability threshold via inner bootstrap + outer 10-fold CV ==========
+print("\nOptimizing LASSO stability threshold via inner bootstrap + outer 10-fold CV...")
 
 candidate_thresholds_lasso <- seq(0.5, 0.95, by = 0.05)
 print(paste("Testing thresholds:", paste(candidate_thresholds_lasso, collapse = ", ")))
@@ -325,8 +356,8 @@ lasso_thr_plot <- ggplot(lasso_thr_df, aes(x = Threshold, y = Mean_AUC)) +
                 label = sprintf("1-SE\n%.2f\nAUC=%.4f", Threshold, Mean_AUC)),
             vjust = -1.5, color = "red", size = 3.5, family = "sans") +
   scale_x_continuous(breaks = candidate_thresholds_lasso) +
-  labs(title = "Optimization of LASSO Stability Threshold via 10-fold Nested CV",
-       subtitle = "1-SE criterion: median threshold within 1 SE of peak AUC (Harrell, 2015)",
+  labs(title = "Optimization of LASSO Stability Threshold via Bootstrap Frequency + 10-fold CV (1-SE)",
+       subtitle = "Bootstrap resampling (50 reps) for selection frequency; 10-fold CV on the threshold; 1-SE median rule (Harrell, 2015)",
        x = "Stability Threshold", y = "Mean CV-AUC") +
   theme_bw() +
   theme(plot.title = element_text(size = 12, face = "bold", family = "sans"),
@@ -352,6 +383,7 @@ best_lambda <- LASSO_model$lambda.min
 # LASSO Coefficient Path - base plot with sans font
 # filename=NULL 时仅在当前设备上绘制（供 2×2 组合图复用，不新建设备）
 plot_LASSO_path <- function(model, best_lambda, filename, width, height, res = NULL) {
+  if (!is.null(filename) && !PLOTS_ENABLED) return(invisible(NULL))
   if (!is.null(filename)) {
     if (!is.null(res)) {
       png(filename, width = width, height = height, res = res, family = "sans")
@@ -384,6 +416,7 @@ plot_LASSO_path(LASSO_model$glmnet.fit, best_lambda, "LASSO_coefficient_path.tif
 # Helper: save base R plot to PDF/PNG/TIFF
 save_base_plot_triple <- function(plot_fn, pdf_name, png_name, tif_name,
                                    pdf_w = 10, pdf_h = 8, rast_w = 6000, rast_h = 4800) {
+  if (!PLOTS_ENABLED) return(invisible(NULL))
   pdf(pdf_name, width = pdf_w, height = pdf_h, family = "sans")
   plot_fn()
   dev.off()
@@ -408,7 +441,8 @@ save_base_plot_triple <- function(plot_fn, pdf_name, png_name, tif_name,
 combine_sci_2x2 <- function(panels, out_base,
                             pdf_w = 12, pdf_h = 10) {
   stopifnot(length(panels) == 4)
-  
+  if (!PLOTS_ENABLED) return(invisible(NULL))
+
   draw_combined <- function() {
     par(mfrow = c(2, 2), family = "sans")
     for (i in seq_len(4)) {
@@ -462,6 +496,7 @@ save_base_plot_triple(plot_lasso_cv_error,
 # main_title="" 时去除标题（组合图用；单图保留原标题）
 plot_LASSO_freq <- function(freq_table, output_file, width, height, res = NULL,
                             main_title = "LASSO Feature Selection Frequency") {
+  if (!is.null(output_file) && !PLOTS_ENABLED) return(invisible(NULL))
   if (!is.null(output_file)) {
     if (!is.null(res)) {
       png(output_file, width = width, height = height, res = res, family = "sans")
@@ -527,31 +562,52 @@ df_aic <- as.data.frame(X)
 df_aic$y <- y  # y is already 0/1 numeric
 df_aic <- df_aic[, c(setdiff(colnames(df_aic), "y"), "y")]
 
-# Run exhaustive AIC
-aic_result <- bestglm(df_aic, IC = "AIC", family = binomial, method = "exhaustive")
+# Run AIC selection.
+# 注意：bestglm 的二项 GLM 穷举实现硬性限制 p <= 15（需枚举 2^p 个模型）。
+# 折内重放后候选特征数通常为 15，但个别折因 VIF/相关性过滤保留更多列（如 16），
+# 此时穷举不可行，退化为双向逐步 AIC（stats::step），并在日志中显式记录口径。
+p_aic <- ncol(df_aic) - 1
+aic_method <- if (p_aic <= 15) "exhaustive" else "stepwise"
+cat(sprintf("AIC selection method: %s (candidate predictors p = %d; bestglm exhaustive cap = 15)\n",
+            aic_method, p_aic))
 
-print(aic_result)
+if (aic_method == "exhaustive") {
+  aic_result <- bestglm(df_aic, IC = "AIC", family = binomial, method = "exhaustive")
+  print(aic_result)
+  best_model <- aic_result$BestModel
+} else {
+  cat("NOTE: p > 15 exceeds bestglm's exhaustive cap; using bidirectional stepwise AIC.\n")
+  full_model <- glm(y ~ ., data = df_aic, family = binomial)
+  best_model <- stats::step(full_model, direction = "both", trace = 0)
+  aic_result <- NULL
+}
 
 # Extract best model features
-best_model <- aic_result$BestModel
 best_formula <- formula(best_model)
 feat_exhaustive <- attr(terms(best_formula), "term.labels")
 if (length(feat_exhaustive) == 0) feat_exhaustive <- character(0)
-print(paste("Exhaustive AIC selected features:", paste(feat_exhaustive, collapse = ", ")))
+print(paste(sprintf("AIC selected features (%s):", aic_method),
+            paste(feat_exhaustive, collapse = ", ")))
 print(paste("Number of features:", length(feat_exhaustive)))
 
 write.csv(feat_exhaustive, "Exhaustive_AIC_features.csv", row.names = FALSE)
 
-# --- Exhaustive AIC: Model Size vs AIC Plot ---
-aic_subset <- aic_result$Subsets
-# 修复：行名是 "0 ", "1 ", "11*" 等格式，带空格和可能的 * 标记
-# 需要去掉空格和 * 后转换为数字
-n_features_raw <- gsub("\\s+|\\*", "", rownames(aic_subset))
-aic_df <- data.frame(
-  n_features = as.numeric(n_features_raw),
-  AIC = aic_subset$AIC
-)
-best_idx <- which.min(aic_df$AIC)
+# --- AIC: Model Size vs AIC Plot ---
+# 仅穷举模式有完整子集表；逐步回退时无子集表，留空数据（桥接模式本就不绘图）
+if (!is.null(aic_result)) {
+  aic_subset <- aic_result$Subsets
+  # 修复：行名是 "0 ", "1 ", "11*" 等格式，带空格和可能的 * 标记
+  # 需要去掉空格和 * 后转换为数字
+  n_features_raw <- gsub("\\s+|\\*", "", rownames(aic_subset))
+  aic_df <- data.frame(
+    n_features = as.numeric(n_features_raw),
+    AIC = aic_subset$AIC
+  )
+  best_idx <- which.min(aic_df$AIC)
+} else {
+  aic_df <- data.frame(n_features = integer(0), AIC = numeric(0))
+  best_idx <- integer(0)
+}
 
 # Exhaustive AIC: Model Size vs AIC Plot
 # main_title="" 时去除标题（组合图用；单图保留原标题）
@@ -704,8 +760,8 @@ save_plot_triple(k_auc_plot,
                  "mRMRe_Optimal_k_Selection.png",
                  "mRMRe_Optimal_k_Selection.tif")
 
-# ========== Step 1.5: Optimize stability threshold via nested CV ==========
-print("\nStep 1.5: Optimizing stability threshold via nested CV...")
+# ========== Step 1.5: Optimize stability threshold via inner bootstrap + outer 10-fold CV ==========
+print("\nStep 1.5: Optimizing stability threshold via inner bootstrap + outer 10-fold CV...")
 
 # 候选阈值（从 0.5 到 0.95，步长 0.05）
 candidate_thresholds <- seq(0.5, 0.95, by = 0.05)
@@ -828,8 +884,8 @@ thr_opt_plot <- ggplot(threshold_opt_df, aes(x = Threshold, y = Mean_AUC)) +
                 label = sprintf("1-SE\n%.2f\nAUC=%.4f", Threshold, Mean_AUC)), 
             vjust = -1.5, color = "red", size = 3.5) +
   scale_x_continuous(breaks = candidate_thresholds) +
-  labs(title = "Optimization of mRMRe Stability Threshold via 10-fold Nested CV",
-       subtitle = "1-SE criterion: median threshold within 1 SE of peak AUC (Harrell, 2015)", 
+  labs(title = "Optimization of mRMRe Stability Threshold via Bootstrap Frequency + 10-fold CV (1-SE)",
+       subtitle = "Bootstrap resampling (50 reps) for selection frequency; 10-fold CV on the threshold; 1-SE median rule (Harrell, 2015)", 
        x = "Stability Threshold", y = "Mean CV-AUC") +
   theme_bw() +
   theme(plot.title = element_text(size = 12, face = "bold"),
@@ -889,7 +945,7 @@ for (i in 1:n_bootstrap) {
 selection_freq_pct <- (selection_freq / n_bootstrap) * 100
 selection_freq_sorted <- sort(selection_freq_pct, decreasing = TRUE)
 
-# Note: mrmre_threshold is already optimized in Step 1.5 (via nested CV)
+# Note: mrmre_threshold is already optimized in Step 1.5 (via inner bootstrap + outer 10-fold CV)
 # mrmre_threshold now contains the CV-optimized value (e.g., 55%)
 stable_mrmre_features <- names(selection_freq_pct[selection_freq_pct >= mrmre_threshold])
 print(paste0("mRMRe high-stability features (>=", mrmre_threshold, "% Bootstrap frequency):"))
@@ -1178,40 +1234,42 @@ consensus_matrix <- consensus_matrix[order(-selection_counts), , drop = FALSE]
 # pheatmap consensus matrix
 # IMPROVEMENT: Use temporary file instead of pdf(NULL) for safer device handling
 # (pheatmap internally opens a device for layout computation even with filename=NA)
-tmp_pdf <- tempfile(fileext = ".pdf")
-pdf(tmp_pdf)
-consensus_hm <- pheatmap(consensus_matrix,
-  cluster_rows = FALSE,
-  cluster_cols = FALSE,
-  color = c("#E8E8E8", "#2E86AB"),
-  legend = FALSE,
-  display_numbers = TRUE,
-  number_color = "black",
-  fontsize_number = 10,
-  fontsize_row = 10,
-  fontsize_col = 11,
-  main = "Consensus Matrix: Feature Selection by Four Methods\n(>=3 Methods = Final Consensus)",
-  angle_col = 0,
-  border_color = "white",
-  filename = NA
-)
-dev.off()
-unlink(tmp_pdf)
+if (PLOTS_ENABLED) {
+  tmp_pdf <- tempfile(fileext = ".pdf")
+  pdf(tmp_pdf)
+  consensus_hm <- pheatmap(consensus_matrix,
+    cluster_rows = FALSE,
+    cluster_cols = FALSE,
+    color = c("#E8E8E8", "#2E86AB"),
+    legend = FALSE,
+    display_numbers = TRUE,
+    number_color = "black",
+    fontsize_number = 10,
+    fontsize_row = 10,
+    fontsize_col = 11,
+    main = "Consensus Matrix: Feature Selection by Four Methods\n(>=3 Methods = Final Consensus)",
+    angle_col = 0,
+    border_color = "white",
+    filename = NA
+  )
+  dev.off()
+  unlink(tmp_pdf)
 
-pdf("Consensus_Matrix_3Methods_Consensus.pdf", width = 8, height = 10, family = "sans")
-grid::grid.newpage()
-grid::grid.draw(consensus_hm$gtable)
-dev.off()
+  pdf("Consensus_Matrix_3Methods_Consensus.pdf", width = 8, height = 10, family = "sans")
+  grid::grid.newpage()
+  grid::grid.draw(consensus_hm$gtable)
+  dev.off()
 
-png("Consensus_Matrix_3Methods_Consensus.png", width = 4800, height = 6000, res = 600, family = "sans")
-grid::grid.newpage()
-grid::grid.draw(consensus_hm$gtable)
-dev.off()
+  png("Consensus_Matrix_3Methods_Consensus.png", width = 4800, height = 6000, res = 600, family = "sans")
+  grid::grid.newpage()
+  grid::grid.draw(consensus_hm$gtable)
+  dev.off()
 
-tiff("Consensus_Matrix_3Methods_Consensus.tif", width = 4800, height = 6000, res = 600, family = "sans")
-grid::grid.newpage()
-grid::grid.draw(consensus_hm$gtable)
-dev.off()
+  tiff("Consensus_Matrix_3Methods_Consensus.tif", width = 4800, height = 6000, res = 600, family = "sans")
+  grid::grid.newpage()
+  grid::grid.draw(consensus_hm$gtable)
+  dev.off()
+}
 
 # --- 6c. Consensus_3 Feature Count Bar Chart ---
 # 显示每个特征被几种方法选中，红色高亮 >=3 的共识特征
@@ -1295,7 +1353,7 @@ write.csv(final_features, "final_selected_features.csv", row.names = FALSE)
 # ===================== 7. Final Model & Diagnostics =====================
 print("\nGenerating final model, diagnostics, and forest plot...")
 
-if (length(final_features) > 0) {
+if (!BRIDGE_MODE && length(final_features) > 0) {
   # Fit final logistic regression model
   final_formula <- as.formula(paste("y_vector ~", paste(final_features, collapse = " + ")))
   final_model <- glm(final_formula, data = as.data.frame(X_matrix), family = binomial)
@@ -1412,6 +1470,8 @@ if (length(final_features) > 0) {
                    "Final_Model_Forest_Plot.pdf",
                    "Final_Model_Forest_Plot.png",
                    "Final_Model_Forest_Plot.tif")
+} else if (BRIDGE_MODE) {
+  cat("BRIDGE_MODE: skipping final-model diagnostics and forest plot.\n")
 } else {
   print("No final features selected. Skipping diagnostics and forest plot.")
 }
@@ -1462,9 +1522,7 @@ summary_lines <- c(
       paste("    ", names(vif_values), "=", round(vif_values, 2)))
   } else "  VIF: not computed",
   if (exists("high_vif") && length(high_vif) > 0) 
-    paste("  WARNING: High VIF (>10) in:", paste(names(high_vif), collapse = ", ")) else ""
-  ,
-  "",
+    paste("  WARNING: High VIF (>10) in:", paste(names(high_vif), collapse = ", ")) else "",
   "========================================",
   "Selection Rule (>=3 Methods Majority Voting):",
   "  1. Features selected by >=3 out of 4 methods (majority voting)",
@@ -1480,6 +1538,8 @@ writeLines(summary_lines, summary_file)
 print(summary_lines)
 
 # ===================== 9. Apply to Validation Cohorts =====================
+# 桥接模式跳过本节（折内重放不需要改写任何验证队列文件）
+if (!BRIDGE_MODE) {
 print("\nApplying feature selection to validation cohorts (no data leakage)...")
 
 if (length(final_features) > 0) {
@@ -1582,6 +1642,7 @@ if (length(final_features) > 0) {
 } else {
   print("No final features selected. Cannot apply to validation cohorts.")
 }
+}  # end if (!BRIDGE_MODE) — 第 9 节在桥接模式下整体跳过
 
 # 低危修复2：在 summary 文件末尾追加 sessionInfo() 输出，记录运行环境以保证结果可复现
 sink(summary_file, append = TRUE)
@@ -1590,6 +1651,15 @@ cat("Session Info (运行环境记录，用于结果复现)\n")
 cat("========================================\n")
 print(sessionInfo())
 sink()
+
+# ===================== 10. Bridge Output（桥接模式写出共识特征） =====================
+if (BRIDGE_MODE) {
+  if (length(final_features) == 0) {
+    stop("BRIDGE: 最终共识特征为空，无法向调用方返回结果")
+  }
+  writeLines(final_features, BRIDGE_OUTPUT)
+  cat("BRIDGE: final features written to ", BRIDGE_OUTPUT, "\n", sep = "")
+}
 
 print("\n========================================")
 print(paste("All tasks completed. Results saved to", OUTPUT_DIR))

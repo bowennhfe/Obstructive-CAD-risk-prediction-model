@@ -30,24 +30,39 @@ RESULT_DIR = os.path.join(BASE_DIR, 'data_preprocessing')
 os.makedirs(RESULT_DIR, exist_ok=True)
 
 # Auto-search for cohort CSV files in BASE_DIR
+# 本项目自身会向下列目录写出同名 *_cohort*.csv（01/02/03/04/05/07 的输出），
+# 二次运行时若把它们当原始输入，会把已处理数据再加工一遍，故必须排除。
+EXCLUDE_DIRS = {"data_preprocessing", "vif_analysis", "feature_selection",
+                "Model Selection", "Model Development", "Subgroup Analysis",
+                "Blinded Validation", "Clinical_Plots_R", "Nested CV Work"}
+
 def _find_cohort_file(pattern, required=True):
     """Search for a cohort CSV file matching the pattern in BASE_DIR.
+
+    只接受项目根目录下的文件；根目录没有结果时才向一层子目录回退，
+    且跳过本项目的输出目录（见 EXCLUDE_DIRS）。
     If required=False, returns None when file not found (optional cohort)."""
-    matches = glob.glob(os.path.join(BASE_DIR, pattern))
-    # Also search one level deeper (e.g., subfolders)
-    if not matches:
-        matches = glob.glob(os.path.join(BASE_DIR, '*', pattern))
-    if not matches:
+    base_abs = os.path.abspath(BASE_DIR)
+    candidates = [p for p in glob.glob(os.path.join(BASE_DIR, pattern))
+                  if os.path.dirname(os.path.abspath(p)) == base_abs]
+    # Also search one level deeper (e.g., subfolders), excluding own outputs
+    if not candidates:
+        for p in glob.glob(os.path.join(BASE_DIR, '*', pattern)):
+            parent = os.path.basename(os.path.dirname(os.path.abspath(p)))
+            if parent not in EXCLUDE_DIRS:
+                candidates.append(p)
+    if not candidates:
         if required:
             raise FileNotFoundError(
                 f"Cannot find file matching '{pattern}' in {BASE_DIR}. "
                 f"Please ensure the cohort CSV file exists."
             )
         return None
-    if len(matches) > 1:
-        print(f"  WARNING: Multiple matches for '{pattern}': {matches}")
-        print(f"  Using: {matches[0]}")
-    return matches[0]
+    candidates.sort()   # glob 顺序不保证稳定，排序使多匹配时选择可复现
+    if len(candidates) > 1:
+        print(f"  WARNING: Multiple matches for '{pattern}': {candidates}")
+        print(f"  Using: {candidates[0]}")
+    return candidates[0]
 
 print(f"BASE_DIR:  {BASE_DIR}")
 print(f"RESULT_DIR: {RESULT_DIR}")
@@ -562,7 +577,7 @@ def main():
                 for method_name, method_func in methods.items():
                     try:
                         imputed_values = method_func(train_fold, val_fold, col_to_test)
-                        denom = np.std(true_values)
+                        denom = np.std(true_values, ddof=1)
                         if denom == 0:
                             nrmse = 0.0
                         else:

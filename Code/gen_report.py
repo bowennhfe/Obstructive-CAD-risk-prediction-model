@@ -34,7 +34,13 @@ for _, row in summary_df.iterrows():
             continue
         val = row[col]
         if pd.notna(val):
-            report_lines.append(f"    {col}: {val:.3f}")
+            # final_model_summary.csv 含字符串列（Brier_Source / AUPRC_Source / Cutoff_Source）
+            if isinstance(val, bool):
+                report_lines.append(f"    {col}: {val}")
+            elif isinstance(val, (int, float)) or hasattr(val, "dtype"):
+                report_lines.append(f"    {col}: {val:.3f}")
+            else:
+                report_lines.append(f"    {col}: {val}")
 
 report_lines.append("\n" + "-" * 50)
 report_lines.append("Independent AUC Comparison (bootstrap z-test, independent samples)")

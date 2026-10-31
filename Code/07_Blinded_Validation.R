@@ -1,34 +1,33 @@
 # =============================================================================
-# 07_Prospective_Validation.R — 前瞻队列外部验证（R 实现，风格参照 05/06）
+# 07_Blinded_Validation.R — 盲法队列外部验证（R 实现，风格参照 05/06）
 # =============================================================================
 # 做法由 temporal_mode.txt（Python 07 写出）决定，两种策略二选一：
-#   [calibration，默认] 前瞻集先按模型原始概率算一遍（Raw），再用时间集（Temporal）
+#   [calibration，默认] 盲法集先按模型原始概率算一遍（Raw），再用时间集（Temporal）
 #                       拟合校准器（Platt / 逻辑回归）后算第二遍（Recalibrated）。
 #   [merge]             Derivation-only 模型（重训前） vs 并入 Temporal 重训后的模型
 #                       （重训后）两套结果对比；重训后不再做时间集重校准。
 #
 # 数据流：
-#   - 模型对 Derivation / Temporal / Prospective 的概率由建模流程（Python 07）导出为 CSV；
-#     merge 模式下额外导出 probsp_retrained（重训后模型概率）。
+#   - 模型对 Derivation / Temporal / Blinded 的概率由建模流程（Python 07）导出为 CSV；
+#     merge 模式下额外导出 prob_blind_retrained（重训后模型概率）。
 #   - 可视化风格参照 05_Model_Development.py（Part 2 成长/亚组）与 06_Clinical_Plots_R.R。
 #
-# 输入（Prospective Validation/）：
+# 输入（Blinded Validation/）：
 #   - temporal_mode.txt             (calibration | merge)
-#   - prospective_predictions.csv   (label, probsp_raw[, probsp_retrained])
-#   - temporal_predictions.csv      (label, probsp_raw[, probsp_retrained])
-#   - derivation_predictions.csv    (label, probsp_raw[, probsp_retrained])
+#   - blinded_predictions.csv   (label, prob_blind_raw[, prob_blind_retrained])
+#   - temporal_predictions.csv      (label, prob_blind_raw[, prob_blind_retrained])
 #   - Model Selection/model_selection_metrics.csv          —— 推荐模型 + 原始最优截断值
 # 输出：
-#   - calibration 模式 → Prospective Validation/R_outputs/
-#   - merge 模式       → Prospective Validation/R_outputs_Temporal_Merged/
-#   - 表格：Prospective_Validation_Summary.csv, Prospective_HosmerLemeshow.csv,
-#           Prospective_Cutoff_Sensitivity.csv,
-#   - 图（各 TIFF+PDF+PNG）：Prospective_ROC_AUPRC_*（ROC + PR 双图，merge 模式含两条曲线）,
-#           Prospective_Calibration_Curves_*, Prospective_DCA_Curves_*,
-#           Prospective_ConfusionMatrix*,
-#           Prospective_Probability_Distribution_*,
-#           Prospective_Comparison_*（两套结果对比拼图：校准曲线 + 决策曲线）
-#   - 报告：Prospective_Report.txt
+#   - calibration 模式 → Blinded Validation/R_outputs/
+#   - merge 模式       → Blinded Validation/R_outputs_Temporal_Merged/
+#   - 表格：Blinded_Validation_Summary.csv, Blinded_HosmerLemeshow.csv,
+#           Blinded_Cutoff_Sensitivity.csv,
+#   - 图（各 TIFF+PDF+PNG）：Blinded_ROC_AUPRC_*（ROC + PR 双图，merge 模式含两条曲线）,
+#           Blinded_Calibration_Curves_*, Blinded_DCA_Curves_*,
+#           Blinded_ConfusionMatrix*,
+#           Blinded_Probability_Distribution_*,
+#           Blinded_Comparison_*（两套结果对比拼图：校准曲线 + 决策曲线）
+#   - 报告：Blinded_Report.txt
 # =============================================================================
 
 # --- 1. 加载/安装必需包 ---
@@ -71,22 +70,22 @@ if (length(file_arg) > 0) {
   BASE_DIR <- dirname(getwd())
 }
 MODEL_SEL_DIR <- file.path(BASE_DIR, "Model Selection")
-PROSP_DIR     <- file.path(BASE_DIR, "Prospective Validation")
+BLIND_DIR     <- file.path(BASE_DIR, "Blinded Validation")
 
 # --- Temporal 策略开关（由 Python 07 写入 temporal_mode.txt） ---
 #   calibration : Temporal 仅用于拟合重校准器（默认）
 #   merge       : Temporal 并入训练集重训模型（model revision）
-mode_file <- file.path(PROSP_DIR, "temporal_mode.txt")
+mode_file <- file.path(BLIND_DIR, "temporal_mode.txt")
 TEMPORAL_MODE <- if (file.exists(mode_file)) trimws(readLines(mode_file, warn = FALSE)[1]) else "calibration"
 if (!TEMPORAL_MODE %in% c("calibration", "merge")) TEMPORAL_MODE <- "calibration"
 cat(sprintf(">>> Temporal strategy: %s\n", TEMPORAL_MODE))
 
-OUTPUT_DIR <- if (TEMPORAL_MODE == "merge") file.path(PROSP_DIR, "R_outputs_Temporal_Merged") else file.path(PROSP_DIR, "R_outputs")
+OUTPUT_DIR <- if (TEMPORAL_MODE == "merge") file.path(BLIND_DIR, "R_outputs_Temporal_Merged") else file.path(BLIND_DIR, "R_outputs")
 dir.create(OUTPUT_DIR, showWarnings = FALSE, recursive = TRUE)
 
 # --- 关键输入校验 ---
-for (fn in c("prospective_predictions.csv", "temporal_predictions.csv", "derivation_predictions.csv")) {
-  fp <- file.path(PROSP_DIR, fn)
+for (fn in c("blinded_predictions.csv", "temporal_predictions.csv")) {
+  fp <- file.path(BLIND_DIR, fn)
   if (!file.exists(fp)) stop("缺少输入文件（请先运行建模流程生成）：", fp)
 }
 
@@ -139,7 +138,7 @@ theme_sci <- function() {
 # =============================================================================
 read_model_name <- function() {
   p <- file.path(MODEL_SEL_DIR, "model_selection_metrics.csv")
-  if (!file.exists(p)) { cat("  WARNING: model_selection_metrics.csv 缺失，默认 MLP\n"); return("MLP") }
+  if (!file.exists(p)) { stop("model_selection_metrics.csv 缺失，无法确定推荐模型（MLP 已从流水线移除）。请先运行 04_Model_Selection.py。") }
   df <- read.csv(p, stringsAsFactors = FALSE)
   best <- df[which.max(df$AB_Score), ]
   cat(sprintf(">>> Recommended model: %s (AB_Score=%.4f)\n", best$Model, best$AB_Score))
@@ -148,16 +147,13 @@ read_model_name <- function() {
 model_name <- read_model_name()
 cat(sprintf("Model: %s\n", model_name))
 
-pred  <- read.csv(file.path(PROSP_DIR, "prospective_predictions.csv"), stringsAsFactors = FALSE)
-tempd <- read.csv(file.path(PROSP_DIR, "temporal_predictions.csv"), stringsAsFactors = FALSE)
-derid <- read.csv(file.path(PROSP_DIR, "derivation_predictions.csv"), stringsAsFactors = FALSE)
+pred  <- read.csv(file.path(BLIND_DIR, "blinded_predictions.csv"), stringsAsFactors = FALSE)
+tempd <- read.csv(file.path(BLIND_DIR, "temporal_predictions.csv"), stringsAsFactors = FALSE)
 
 y     <- as.integer(pred$label)
-p_raw <- as.numeric(pred$probsp_raw)
+p_raw <- as.numeric(pred$prob_blind_raw)
 y_t   <- as.integer(tempd$label)
-p_t   <- as.numeric(tempd$probsp_raw)
-y_d   <- as.integer(derid$label)
-p_d   <- as.numeric(derid$probsp_raw)
+p_t   <- as.numeric(tempd$prob_blind_raw)
 
 # 原始最优截断值（来自 04）
 cutoff_raw <- 0.5
@@ -170,14 +166,14 @@ if (file.exists(ms_path)) {
 
 # --- 两套结果的命名与数据来源（随 Temporal 策略） ---
 if (TEMPORAL_MODE == "merge") {
-  if (!"probsp_retrained" %in% names(pred))
-    stop("merge 模式需要 prospective_predictions.csv 含 probsp_retrained 列；请用 --temporal-mode merge 重跑 Python 07。")
-  if (!"probsp_retrained" %in% names(derid))
-    stop("merge 模式需要 derivation_predictions.csv 含 probsp_retrained 列；请用 --temporal-mode merge 重跑 Python 07。")
-  LAB_A_LEG <- "Raw"
-  LAB_B_LEG <- "Recalibrated"
-  LAB_A_SHORT <- "Raw"
-  LAB_B_SHORT <- "Recalibrated"
+  if (!"prob_blind_retrained" %in% names(pred))
+    stop("merge 模式需要 blinded_predictions.csv 含 prob_blind_retrained 列；请用 --temporal-mode merge 重跑 Python 07。")
+  # merge 模式两套结果是"重训前 / 重训后"，标签必须与 STATUS 一致，
+  # 否则图例、汇总表、对比拼图、报告都会把 merge 结果标成 Raw/Recalibrated。
+  LAB_A_LEG <- "Before retraining"
+  LAB_B_LEG <- "After retraining"
+  LAB_A_SHORT <- "Before"
+  LAB_B_SHORT <- "After"
   STATUS_A  <- "Before retraining (Derivation only)"
   STATUS_B  <- "After retraining (Derivation + Temporal)"
   COMP_TITLE <- "Before vs After retraining"
@@ -196,7 +192,7 @@ if (TEMPORAL_MODE == "merge") {
 }
 
 # =============================================================================
-# --- 5. 生成前瞻两套概率 ---
+# --- 5. 生成盲法两套概率 ---
 #   calibration 模式：在 R 中拟合 Platt 校准器（时间集）→ p_cal_vals
 #   merge 模式      ：第二套 = 并入 Temporal 重训后模型的原始概率
 # =============================================================================
@@ -204,24 +200,53 @@ if (TEMPORAL_MODE == "merge") {
   cat("\n=== Recalibration skipped (Temporal is part of the training set) ===\n")
   qlogis_safe <- function(p, eps = 1e-6) qlogis(pmin(pmax(p, eps), 1 - eps))
   cal_a <- NA_real_; cal_b <- NA_real_
-  p_cal_vals   <- as.numeric(pred$probsp_retrained)
-  p_d_cal_vals <- as.numeric(derid$probsp_retrained)
+  CAL_SOURCE <- "(none: Temporal is part of the training set)"
+  p_cal_vals   <- as.numeric(pred$prob_blind_retrained)
   cutoff_cal   <- cutoff_raw
   cat(sprintf("  Cutoff applied to both models: %.4f (Derivation optimal)\n", cutoff_raw))
-  cat(sprintf("  Prospective n=%d (events=%d, prevalence=%.3f)\n", length(y), sum(y), mean(y)))
+  cat(sprintf("  Blinded n=%d (events=%d, prevalence=%.3f)\n", length(y), sum(y), mean(y)))
 } else {
-  cat("\n=== Fitting recalibrator on Temporal (in R) ===\n")
+  cat("\n=== Recalibrator on Temporal ===\n")
   qlogis_safe <- function(p, eps = 1e-6) qlogis(pmin(pmax(p, eps), 1 - eps))
-  fit_cal <- glm(y_t ~ qlogis_safe(p_t), family = binomial())
-  cal_a <- unname(coef(fit_cal)[2])   # 斜率（logit 尺度）
-  cal_b <- unname(coef(fit_cal)[1])   # 截距
-  cat(sprintf("  Calibrator: slope=%.4f, intercept=%.4f\n", cal_a, cal_b))
 
-  p_cal_vals   <- plogis(cal_a * qlogis_safe(p_raw) + cal_b)   # 前瞻校准概率
-  cutoff_cal   <- plogis(cal_a * qlogis_safe(cutoff_raw) + cal_b)
-  p_d_cal_vals <- plogis(cal_a * qlogis_safe(p_d) + cal_b)     # Derivation 校准概率（分层用）
+  # 优先复用 Python 07 已拟合的校准器系数（保证两端口径完全一致）；
+  # 仅在缺少 blinded_calibrator.csv 时才在 R 内重新拟合 glm。
+  cal_path <- file.path(BLIND_DIR, "blinded_calibrator.csv")
+  if (file.exists(cal_path)) {
+    cal_tab <- read.csv(cal_path, stringsAsFactors = FALSE)
+    cal_a <- as.numeric(cal_tab$Slope_logit[1])
+    cal_b <- as.numeric(cal_tab$Intercept_logit[1])
+    cutoff_cal <- as.numeric(cal_tab$Cutoff_Recalibrated[1])
+    if (!is.finite(cal_a) || !is.finite(cal_b)) {
+      # merge 模式写出的空值/NaN 会被读成 NA，as.numeric 后非有限 —— 必须回退到 R 内拟合，
+      # 否则 plogis(NA) 会让全部校准概率变成 NA。
+      cat("  WARNING: blinded_calibrator.csv 的 Slope/Intercept 非有限值，改为在 R 内重新拟合。\n")
+      fit_cal <- glm(y_t ~ qlogis_safe(p_t), family = binomial())
+      cal_a <- unname(coef(fit_cal)[2])
+      cal_b <- unname(coef(fit_cal)[1])
+      CAL_SOURCE <- "Refit in R via glm(y ~ qlogis(p), family=binomial()) (fallback: non-finite coefficients in CSV)"
+    } else {
+      CAL_SOURCE <- "Reused from 07_Blinded_Validation.py (blinded_calibrator.csv)"
+    }
+    if (!is.finite(cutoff_cal)) {
+      cutoff_cal <- plogis(cal_a * qlogis_safe(cutoff_raw) + cal_b)
+    }
+    cat(sprintf("  Calibrator: slope=%.4f, intercept=%.4f [source: %s]\n",
+                cal_a, cal_b, CAL_SOURCE))
+  } else {
+    fit_cal <- glm(y_t ~ qlogis_safe(p_t), family = binomial())
+    cal_a <- unname(coef(fit_cal)[2])   # 斜率（logit 尺度）
+    cal_b <- unname(coef(fit_cal)[1])   # 截距
+    cutoff_cal <- plogis(cal_a * qlogis_safe(cutoff_raw) + cal_b)
+    CAL_SOURCE <- "Refit in R via glm(y ~ qlogis(p), family=binomial())"
+    cat(sprintf("  Calibrator: slope=%.4f, intercept=%.4f [fitted in R, fallback]\n",
+                cal_a, cal_b))
+  }
+
+  p_cal_vals   <- plogis(cal_a * qlogis_safe(p_raw) + cal_b)   # 盲法校准概率
+  # p_d_cal_vals（Derivation 校准概率）在本流程中未被任何图层或表格引用，已删除
   cat(sprintf("  Cutoff: raw=%.4f -> recalibrated=%.4f\n", cutoff_raw, cutoff_cal))
-  cat(sprintf("  Prospective n=%d (events=%d, prevalence=%.3f)\n", length(y), sum(y), mean(y)))
+  cat(sprintf("  Blinded n=%d (events=%d, prevalence=%.3f)\n", length(y), sum(y), mean(y)))
 }
 
 # =============================================================================
@@ -243,6 +268,11 @@ calib_slope_intercept <- function(y, p) {
   fit <- glm(y ~ qlogis_safe(p), family = binomial())
   c(slope = unname(coef(fit)[2]), intercept = unname(coef(fit)[1]))
 }
+# 自适应分箱数：n < 50 时 g = max(3, min(10, n %/% 5))，避免稀疏队列每个 HL 箱
+# 期望事件过少导致卡方近似失效；n >= 50 时沿用 g = 10 与 05/07 Python 一致。
+hl_bins_for_n <- function(n) if (n < 50) max(3, min(10, n %/% 5)) else 10
+hl_test_adaptive <- function(y, p) hl_test(y, p, g = hl_bins_for_n(length(y)))
+
 hl_test <- function(y, p, g = 10) {
   br <- unique(quantile(p, probs = seq(0, 1, length.out = g + 1), na.rm = TRUE))
   if (length(br) < 3) return(c(chi2 = NA, df = NA, p = NA))
@@ -277,8 +307,8 @@ self_cutoff <- function(y, p) {
 
 metrics_row <- function(y, p, cutoff, calstatus) {
   a <- auc_ci(y, p); ap <- auprc(y, p); cm <- clinical_metrics(y, p, cutoff)
-  cs <- calib_slope_intercept(y, p); hl <- hl_test(y, p)
-  data.frame(Cohort = "Prospective", Calibration_Status = calstatus,
+  cs <- calib_slope_intercept(y, p); hl <- hl_test_adaptive(y, p)
+  data.frame(Cohort = "Blinded", Calibration_Status = calstatus,
              N = length(y), Events = sum(y),
              AUC = a$auc, AUC_CI_Lower = a$lo, AUC_CI_Upper = a$hi, AUPRC = ap,
              Brier = mean((y - p)^2),
@@ -290,23 +320,26 @@ metrics_row <- function(y, p, cutoff, calstatus) {
 }
 
 cat("\n=== Metrics ===\n")
-summary_df <- rbind(
-  metrics_row(y, p_cal_vals, cutoff_cal, STATUS_B),
-  metrics_row(y, p_raw, cutoff_raw, STATUS_A)
-)
+# 每套结果只算一次，后续报告复用（避免重复跑 AUC bootstrap / HL 分箱）
+row_cal <- metrics_row(y, p_cal_vals, cutoff_cal, STATUS_B)
+row_raw <- metrics_row(y, p_raw, cutoff_raw, STATUS_A)
+summary_df <- rbind(row_cal, row_raw)
 rownames(summary_df) <- NULL
-write.csv(summary_df, file.path(OUTPUT_DIR, "Prospective_Validation_Summary.csv"), row.names = FALSE)
+write.csv(summary_df, file.path(OUTPUT_DIR, "Blinded_Validation_Summary.csv"), row.names = FALSE)
 print(summary_df[, c("Cohort","Calibration_Status","N","Events","AUC","AUPRC","Brier","Calib_Slope")])
 
 # Hosmer-Lemeshow
-hl_cal <- hl_test(y, p_cal_vals); hl_raw <- hl_test(y, p_raw)
+# 直接复用 summary 中的 HL 结果（metrics_row 内已用自适应 g 计算）
+hl_cal <- c(chi2 = row_cal$HL_chi2, df = row_cal$HL_df, p = row_cal$HL_p)
+hl_raw <- c(chi2 = row_raw$HL_chi2, df = row_raw$HL_df, p = row_raw$HL_p)
 write.csv(data.frame(
-  Cohort = "Prospective",
+  Cohort = "Blinded",
   Calibration_Status = c(STATUS_A, STATUS_B),
+  Bins = hl_bins_for_n(length(y)),
   Chi2 = c(hl_raw["chi2"], hl_cal["chi2"]),
   df = c(hl_raw["df"], hl_cal["df"]),
   P_value = c(hl_raw["p"], hl_cal["p"])
-), file.path(OUTPUT_DIR, "Prospective_HosmerLemeshow.csv"), row.names = FALSE)
+), file.path(OUTPUT_DIR, "Blinded_HosmerLemeshow.csv"), row.names = FALSE)
 
 # 截断值敏感性（两套）
 cm_raw <- clinical_metrics(y, p_raw, cutoff_raw)
@@ -322,7 +355,7 @@ write.csv(data.frame(
   Cutoff = c(cutoff_raw, sc_raw, cutoff_cal, sc_cal),
   Sensitivity = c(cm_raw$Sens, cm_sc_raw$Sens, cm_cal$Sens, cm_sc_cal$Sens),
   Specificity = c(cm_raw$Spec, cm_sc_raw$Spec, cm_cal$Spec, cm_sc_cal$Spec)
-), file.path(OUTPUT_DIR, "Prospective_Cutoff_Sensitivity.csv"), row.names = FALSE)
+), file.path(OUTPUT_DIR, "Blinded_Cutoff_Sensitivity.csv"), row.names = FALSE)
 
 # =============================================================================
 # --- 7. 绘图（Raw 与 Recalibrated 各一套；参照 06/07 风格） ---
@@ -347,7 +380,7 @@ if (TEMPORAL_MODE == "merge") {
   roc_cols <- setNames(c(COL_RAW, COL_CAL), unique(roc_df$Curve))
 } else {
   roc_df <- roc_coords(y, p_cal_vals)
-  roc_df$Curve <- sprintf("Prospective AUC=%.3f (%.3f-%.3f)", a_cal$auc, a_cal$lo, a_cal$hi)
+  roc_df$Curve <- sprintf("Blinded AUC=%.3f (%.3f-%.3f)", a_cal$auc, a_cal$lo, a_cal$hi)
   roc_cols <- setNames(COL_CAL, unique(roc_df$Curve))
 }
 p_roc <- ggplot(roc_df, aes(fpr, tpr, color = Curve)) +
@@ -391,18 +424,21 @@ make_cal_bins <- function(y, p) {
 plot_calibration <- function(y, p, hl_p, base_name) {
   bins <- make_cal_bins(y, p)
   brier <- mean((y - p)^2)
-  lab <- sprintf("Prospective (Brier=%.3f, HL p=%.3f)", brier, hl_p)
+  lab <- sprintf("Blinded (Brier=%.3f, HL p=%.3f)", brier, hl_p)
   pb <- ggplot(bins, aes(pp, obs)) +
     geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "gray40", linewidth = 0.7) +
     geom_line(color = COL_CAL, linewidth = 0.9) +
     geom_point(color = COL_CAL, shape = 16, size = 2.6) +
     coord_cartesian(xlim = c(0, 1), ylim = c(0, 1)) +
-    labs(x = "Mean Predicted Probability", y = "Observed Proportion") +
-    theme_sci() + theme(legend.position = "none")
+    labs(x = "Mean Predicted Probability", y = "Observed Proportion",
+         title = lab) +
+    theme_sci() + theme(legend.position = "none",
+                        plot.title = element_text(size = FONT_LABEL - 1, hjust = 0.5,
+                                                  face = "plain"))
   save_sci_plot(pb, base_name, 6.5, 6.0, "color")
 }
-plot_calibration(y, p_raw, hl_raw["p"], paste0("Prospective_Calibration_Curves", SFX_A, "_", model_name))
-plot_calibration(y, p_cal_vals, hl_cal["p"], paste0("Prospective_Calibration_Curves", SFX_B, "_", model_name))
+plot_calibration(y, p_raw, hl_raw["p"], paste0("Blinded_Calibration_Curves", SFX_A, "_", model_name))
+plot_calibration(y, p_cal_vals, hl_cal["p"], paste0("Blinded_Calibration_Curves", SFX_B, "_", model_name))
 cat("[2/6] Calibration curves (set 1 + set 2) done.\n")
 
 # ---- 7.3 DCA（07 风格），Raw 与 Calibrated 各一张 ----
@@ -425,6 +461,9 @@ plot_dca <- function(y, p, base_name) {
   lt <- c("Ideal (perfect)" = "dotted", "Treat None" = "dashed", "Treat All" = "dashed", "Model" = "solid")
   reg <- data.frame(Threshold = thr, ymin = nb_all, ymax = pmax(nb, nb_all))
   y_hi <- max(max(nb), prev) * 1.05 + 0.02
+  # y 下限只按模型曲线自适应：Treat All 在高阈值必然陡降至 -1 以下，
+  # 固定 -0.15 会在模型 NB 更低时截断曲线（与 06 DCA 一致）。
+  y_lo <- min(-0.10, min(nb, na.rm = TRUE) - 0.02)
   pd <- ggplot() +
     geom_ribbon(data = reg, aes(Threshold, ymin = ymin, ymax = ymax), fill = COL_CAL, alpha = 0.15) +
     geom_line(data = ddf, aes(Threshold, Net_Benefit, color = Strategy, linetype = Strategy, linewidth = Strategy)) +
@@ -433,14 +472,14 @@ plot_dca <- function(y, p, base_name) {
     scale_linewidth_manual(name = NULL, values = c("Ideal (perfect)" = 0.7, "Treat None" = 0.5,
                                                    "Treat All" = 0.8, "Model" = 1.2)) +
     scale_x_continuous(limits = c(0, 0.80), breaks = seq(0, 0.8, by = 0.1)) +
-    coord_cartesian(ylim = c(-0.15, y_hi)) +
+    coord_cartesian(ylim = c(y_lo, y_hi)) +
     labs(x = "Threshold Probability", y = "Net Benefit") +
     guides(color = guide_legend(override.aes = list(linewidth = 1.2)), linetype = "none", linewidth = "none") +
     theme_sci() + theme(legend.position = c(0.80, 0.80), legend.justification = c(0.5, 0.5))
   save_sci_plot(pd, base_name, 7.0, 6.0, "line")
 }
-plot_dca(y, p_raw, paste0("Prospective_DCA_Curves", SFX_A, "_", model_name))
-plot_dca(y, p_cal_vals, paste0("Prospective_DCA_Curves", SFX_B, "_", model_name))
+plot_dca(y, p_raw, paste0("Blinded_DCA_Curves", SFX_A, "_", model_name))
+plot_dca(y, p_cal_vals, paste0("Blinded_DCA_Curves", SFX_B, "_", model_name))
 cat("[3/6] DCA curves (set 1 + set 2) done.\n")
 
 # ---- 7.4 混淆矩阵（Raw 与 Calibrated 各一张） ----
@@ -459,8 +498,8 @@ plot_cm <- function(y, p, cutoff, base_name) {
     theme(plot.title = element_text(size = FONT_TITLE - 2, hjust = 0.5))
   save_sci_plot(pcm, base_name, 5.5, 4.5, "color")
 }
-plot_cm(y, p_raw, cutoff_raw, paste0("Prospective_ConfusionMatrix", SFX_A))
-plot_cm(y, p_cal_vals, cutoff_cal, paste0("Prospective_ConfusionMatrix", SFX_B))
+plot_cm(y, p_raw, cutoff_raw, paste0("Blinded_ConfusionMatrix", SFX_A))
+plot_cm(y, p_cal_vals, cutoff_cal, paste0("Blinded_ConfusionMatrix", SFX_B))
 cat("[4/6] Confusion matrices (raw + calibrated) done.\n")
 
 # ---- 7.5 PR 曲线（merge 模式：两条曲线；calibration 模式：单条；与 ROC 融合为双图） ----
@@ -498,7 +537,7 @@ p_pr <- p_pr +
 
 # ---- 7.6b ROC (AUC) + PR (AUPRC) 融合为双图 ----
 disc <- p_roc + p_pr
-save_sci_plot(disc, paste0("Prospective_ROC_AUPRC_", model_name), 9.5, 5.5, "color")
+save_sci_plot(disc, paste0("Blinded_ROC_AUPRC_", model_name), 9.5, 5.5, "color")
 cat("[5/6] ROC + PR (AUC + AUPRC) combined figure done.\n")
 
 # ---- 7.7 概率分布（Raw 与 Calibrated 各一张） ----
@@ -512,8 +551,8 @@ plot_dist <- function(y, p, cutoff, base_name) {
     theme_sci() + theme(legend.position = c(0.80, 0.85))
   save_sci_plot(pdist, base_name, 6.5, 5.0, "color")
 }
-plot_dist(y, p_raw, cutoff_raw, paste0("Prospective_Probability_Distribution", SFX_A))
-plot_dist(y, p_cal_vals, cutoff_cal, paste0("Prospective_Probability_Distribution", SFX_B))
+plot_dist(y, p_raw, cutoff_raw, paste0("Blinded_Probability_Distribution", SFX_A))
+plot_dist(y, p_cal_vals, cutoff_cal, paste0("Blinded_Probability_Distribution", SFX_B))
 cat("[6/6] Probability distribution (raw + calibrated) done.\n")
 
 # ---- 7.8 两套结果对比拼图（校准曲线 + 决策曲线） ----
@@ -542,9 +581,13 @@ p_comp_cal <- ggplot(bins_all, aes(pp, obs, color = Set)) +
 thr2 <- seq(0.01, 0.80, by = 0.01); prev2 <- mean(y)
 
 # 决策阈值处的净收益（Net Benefit）数值，直接写入图例括号内
-op_thr    <- cutoff_cal
-nb_raw_op <- nb_curve(y, p_raw, op_thr)
-nb_cal_op <- nb_curve(y, p_cal_vals, op_thr)
+# 两条曲线各自使用自己概率尺度上的决策阈值：
+# raw 曲线用 Derivation 原始截断值，校准曲线用其映射/重校准后的截断值。
+# （若统一用 cutoff_cal 去评估 raw 概率，校准器偏移较大时会算错决策点的 NB）
+op_thr_raw <- cutoff_raw
+op_thr_cal <- cutoff_cal
+nb_raw_op <- nb_curve(y, p_raw, op_thr_raw)
+nb_cal_op <- nb_curve(y, p_cal_vals, op_thr_cal)
 lvl_raw  <- c("Treat None", "Treat All", LAB_A_LEG, LAB_B_LEG)
 lvl_disp <- c("Treat None", "Treat All",
               sprintf("%s (NB=%.3f)", LAB_A_LEG, nb_raw_op),
@@ -562,21 +605,23 @@ lt2   <- setNames(c("dashed", "dashed", "solid", "solid"), lvl_disp)
 
 p_comp_dca <- ggplot(ddf2, aes(Threshold, Net_Benefit, color = Strategy, linetype = Strategy)) +
   geom_line(linewidth = 1.1) +
-  geom_vline(xintercept = op_thr, linetype = "dashed", color = "gray45", linewidth = 0.5) +
-  annotate("point", x = op_thr, y = nb_raw_op, color = COL_RAW, size = 2.6) +
-  annotate("point", x = op_thr, y = nb_cal_op, color = COL_CAL, size = 2.6) +
+  geom_vline(xintercept = op_thr_raw, linetype = "dotted", color = COL_RAW, linewidth = 0.4) +
+  geom_vline(xintercept = op_thr_cal, linetype = "dashed", color = COL_CAL, linewidth = 0.5) +
+  annotate("point", x = op_thr_raw, y = nb_raw_op, color = COL_RAW, size = 2.6) +
+  annotate("point", x = op_thr_cal, y = nb_cal_op, color = COL_CAL, size = 2.6) +
   scale_color_manual(name = NULL, values = cols2) +
   scale_linetype_manual(name = NULL, values = lt2) +
   scale_x_continuous(limits = c(0, 0.80), breaks = seq(0, 0.8, by = 0.1)) +
-  coord_cartesian(ylim = c(-0.15, max(prev2, 0.05) * 1.1 + 0.02)) +
+  coord_cartesian(ylim = c(min(-0.10, min(ddf2$Net_Benefit[ddf2$Strategy %in% lvl_disp[3:4]], na.rm = TRUE) - 0.02),
+                           max(prev2, 0.05) * 1.1 + 0.02)) +
   labs(x = "Threshold Probability", y = "Net Benefit", title = "(B) Decision Curve") +
   theme_sci() + theme(plot.title = element_text(size = FONT_LABEL, face = "bold"),
                       legend.position = c(0.98, 0.98), legend.justification = c(1, 1))
 comp <- p_comp_cal + p_comp_dca
 comp_name <- if (TEMPORAL_MODE == "merge") {
-  paste0("Prospective_Comparison_Before_vs_After_Retraining_", model_name)
+  paste0("Blinded_Comparison_Before_vs_After_Retraining_", model_name)
 } else {
-  paste0("Prospective_Comparison_Raw_vs_Recalibrated_", model_name)
+  paste0("Blinded_Comparison_Raw_vs_Recalibrated_", model_name)
 }
 save_sci_plot(comp, comp_name, 13, 5.5, "color")
 cat("[7b] Comparison composite done.\n")
@@ -586,28 +631,33 @@ cat("[7b] Comparison composite done.\n")
 # =============================================================================
 fmt_m <- function(m) sprintf("AUC=%.3f (%.3f-%.3f), AUPRC=%.3f, Brier=%.4f",
                              m$AUC, m$AUC_CI_Lower, m$AUC_CI_Upper, m$AUPRC, m$Brier)
-m_cal <- metrics_row(y, p_cal_vals, cutoff_cal, STATUS_B)
-m_raw <- metrics_row(y, p_raw, cutoff_raw, STATUS_A)
+m_cal <- row_cal
+m_raw <- row_raw
 rec_line <- if (TEMPORAL_MODE == "merge") {
   "Recalibrator: none (Temporal is part of the training set)"
 } else {
-  sprintf("Recalibrator (Platt, logit): slope=%.4f, intercept=%.4f (fitted on Temporal n=%d)",
-          cal_a, cal_b, length(y_t))
+  sprintf("Recalibrator (Platt, logit): slope=%.4f, intercept=%.4f (Temporal n=%d)\n  Calibrator source: %s",
+          cal_a, cal_b, length(y_t), CAL_SOURCE)
 }
 cut_line <- if (TEMPORAL_MODE == "merge") {
-  sprintf("Cutoff: %.4f (Derivation optimal, applied to both models)", cutoff_raw)
+  sprintf(paste0("Cutoff: %.4f (Derivation optimal, applied to BOTH models)\n",
+                 "  NOTE: the retrained model may have a different probability scale; ",
+                 "the same Derivation-optimal cutoff is applied for comparability ",
+                 "and was NOT re-optimized on the retrained model."), cutoff_raw)
 } else {
   sprintf("Cutoff: raw=%.4f | recalibrated=%.4f", cutoff_raw, cutoff_cal)
 }
 rep_lines <- c(
   "======================================================================",
-  "Prospective Cohort External Validation Report (R)",
+  "Blinded Cohort External Validation Report (R)",
   "======================================================================",
   sprintf("Temporal strategy: %s", TEMPORAL_MODE),
   sprintf("Model: %s", model_name),
   rec_line,
   cut_line,
-  sprintf("Prospective n=%d (events=%d, prevalence=%.3f)", length(y), sum(y), mean(y)),
+  sprintf("Blinded n=%d (events=%d, prevalence=%.3f)", length(y), sum(y), mean(y)),
+  sprintf("Hosmer-Lemeshow bins: g=%d (adaptive: g=10 if n>=50, else max(3, n%%/%%5))",
+          hl_bins_for_n(length(y))),
   "",
   sprintf("=== [Set 1] %s ===", STATUS_A),
   sprintf("  %s", fmt_m(m_raw)),
@@ -627,7 +677,7 @@ rep_lines <- c(
   sprintf("Outputs: %s", OUTPUT_DIR),
   "======================================================================"
 )
-writeLines(rep_lines, file.path(OUTPUT_DIR, "Prospective_Report.txt"))
+writeLines(rep_lines, file.path(OUTPUT_DIR, "Blinded_Report.txt"))
 cat(paste(rep_lines, collapse = "\n"), "\n")
 
-cat("\n=== Prospective Validation (R) Complete ===\n")
+cat("\n=== Blinded Validation (R) Complete ===\n")

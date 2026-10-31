@@ -179,8 +179,10 @@ plot_subgroup_forest <- function(model_name) {
   
   df <- read.csv(data_path, stringsAsFactors = FALSE)
   
-  # CSV 中 Signif_Worse_FDR 存为 "True"/"False"，转为逻辑型以匹配 scale 名称
-  df$Signif_Worse_FDR <- as.logical(df$Signif_Worse_FDR)
+  # CSV 中 Signif_Worse_FDR 可能写成 "True"/"False"（pandas）或 "TRUE"/"FALSE"（R），
+  # as.logical() 只认大写字面量，故统一 toupper 后再比较，NA 兜底为 FALSE
+  df$Signif_Worse_FDR <- toupper(as.character(df$Signif_Worse_FDR)) == "TRUE"
+  df$Signif_Worse_FDR[is.na(df$Signif_Worse_FDR)] <- FALSE
   
   # 筛选亚组：仅保留 Age:, Gender:, HTN: 开头的
   df <- df[grepl("^Age:|^Gender:|^HTN:", df$Subgroup), ]
@@ -250,9 +252,10 @@ plot_subgroup_forest <- function(model_name) {
   # x 轴下限自适应：硬编码 0.3 会静默裁剪 CI 下限更低的低 AUC 亚组
   x_lo <- min(0.3, min(df$CI_Lower, na.rm = TRUE) - 0.02)
   
-  # 右侧文本 x 坐标（超出数据范围）
+  # 右侧文本 x 坐标（超出数据范围）；列间距须与 plot.margin 宽度匹配，
+  # 否则第三列（O/E）会落到画布外被完全裁掉
   x_text_start <- 1.03
-  x_text_auc  <- 1.20
+  x_text_auc  <- 1.18
   x_text_oe   <- 1.42
   
   # 检测主类别变化位置，添加分隔线
@@ -289,7 +292,7 @@ plot_subgroup_forest <- function(model_name) {
               hjust = 0, size = 2.8, family = "sans", color = "black") +
     # 列标题
     annotate("text", x = x_text_start, y = max(df$y_pos) + 0.8,
-             label = "N (Events)", fontface = "bold",
+             label = "Events/N", fontface = "bold",   # N_label 实际为 "events/N" 顺序
              hjust = 0, size = 3.2, family = "sans", color = "black") +
     annotate("text", x = x_text_auc, y = max(df$y_pos) + 0.8,
              label = "AUC (95% CI)", fontface = "bold",
@@ -303,10 +306,14 @@ plot_subgroup_forest <- function(model_name) {
                        labels = scales::label_number(accuracy = 0.1)) +
     scale_y_continuous(breaks = df$y_pos, labels = df$Subgroup) +
     coord_cartesian(xlim = c(x_lo, 0.95), clip = "off") +
-    labs(x = "AUC (95% CI)", y = NULL) +
+    # overall_prev = sum(N_Pos)/sum(N)：各亚组（Age/Gender/HTN 各组均完整划分
+    # 该队列）汇总后即 Geographical 队列的总体事件率
+    labs(x = "AUC (95% CI)", y = NULL,
+         caption = "Expected = N × pooled event rate across the Geographical cohort; O/E < 1 indicates lower observed event rate than pooled.") +
     theme_bw(base_size = FONT_LABEL, base_family = "sans") +
     theme(
       plot.title = element_blank(),
+      plot.caption = element_text(size = FONT_SMALL, hjust = 0),
       axis.title.x = element_text(size = FONT_LABEL),
       axis.text.y = element_text(size = FONT_TICK, hjust = 1),
       axis.text.x = element_text(size = FONT_TICK),
@@ -314,12 +321,12 @@ plot_subgroup_forest <- function(model_name) {
       panel.grid.major.y = element_blank(),
       panel.border = element_blank(),
       axis.line = element_line(color = "black", linewidth = 0.5),
-      plot.margin = margin(10, 180, 5, 5)
+      plot.margin = margin(10, 400, 5, 5)
     )
   
   plot_height <- max(4.5, nrow(df) * 0.45 + 1.2)
   save_sci_plot(p, paste0("Subgroup_Forest_Plot_", model_name),
-                width = 8.0, height = plot_height, dpi_type = "line")
+                width = 11.0, height = plot_height, dpi_type = "line")
   cat("  Subgroup forest plot done.\n")
   return(p)
 }
@@ -351,7 +358,18 @@ plot_clinical_impact <- function(model_name) {
 
     dat <- read.csv(fpath)
     y_true <- dat$y_true
-    y_prob <- dat$y_pred_prob_calibrated  # 使用校准后概率
+    # 与 DCA / CNB / NIA 保持一致：Derivation 用 raw（apparent）概率；
+    # 其 calibrated 概率是自身拟合 Platt 的 in-sample 输出，过度乐观。
+    if (cohort_info$name == "Derivation") {
+      if ("y_pred_prob_raw" %in% colnames(dat)) {
+        y_prob <- dat$y_pred_prob_raw
+      } else {
+        cat("  WARNING: y_pred_prob_raw not found for Derivation, falling back to calibrated.\n")
+        y_prob <- dat$y_pred_prob_calibrated
+      }
+    } else {
+      y_prob <- dat$y_pred_prob_calibrated
+    }
 
     n_total <- length(y_true)
     n_events <- sum(y_true == 1)
@@ -401,7 +419,9 @@ plot_clinical_impact <- function(model_name) {
 
   # 计算左轴缩放因子：使两条曲线在视觉上不重叠打架
   max_left <- max(df_all$N_High_Risk, na.rm = TRUE)
-  scale_factor <- max_left / max(ylim_right)
+  # 保护：全为 0 / 含 NA 时 max_left 可能为 0 或 -Inf，直接相除会得到 Inf/NaN
+  # 并让 PPV 曲线与右轴刻度全部失效（scale_factor=1 退化为不缩放）
+  if (!is.finite(max_left) || max_left == 0) scale_factor <- 1 else scale_factor <- max_left / max(ylim_right)
 
   p <- ggplot() +
     # ---- 左侧条形图：高风险人数 ----
@@ -428,14 +448,18 @@ plot_clinical_impact <- function(model_name) {
     scale_linetype_manual(values = c("Derivation" = "solid", "Temporal" = "solid", "Geographical" = "solid")) +
     labs(x = "Threshold Probability",
          title = paste("Clinical Impact Curve —", model_name),
-         subtitle = "Bars: High-risk patients (opacity); Solid lines: True positives (left axis); Dashed lines: PPV (right axis)") +
-    theme_bw(base_family = "sans") +
+         subtitle = paste("Bars: High-risk patients (opacity); Solid lines: True positives (left axis)",
+                          "Dashed lines: PPV (right axis); Derivation uses apparent raw probabilities",
+                          "Temporal/Geographical use recalibrated probabilities", sep = "\n")) +
+    theme_bw(base_size = FONT_LABEL, base_family = "sans") +
     theme(
       legend.position = "bottom",
       legend.box = "horizontal",
       legend.title = element_blank(),
-      axis.title.y.left = element_text(color = "black", size = FONT_LABEL),
-      axis.title.y.right = element_text(color = "black", size = FONT_LABEL),
+      legend.text = element_text(size = FONT_LEGEND - 1),
+      plot.title = element_text(size = FONT_TITLE),
+      plot.subtitle = element_text(size = FONT_LABEL),
+      axis.title = element_text(color = "black", size = FONT_LABEL),
       axis.text = element_text(size = FONT_TICK),
       panel.grid.minor = element_blank(),
       panel.border = element_blank(),
@@ -505,17 +529,21 @@ plot_calibration_curves <- function(model_name, use_calibrated = TRUE, file_suff
   
   df <- bind_rows(all_data)
   
-  # 根据 use_calibrated 选择概率列（校准后 / 校准前原始概率）
-  if (use_calibrated) {
-    prob_col <- "y_pred_prob_calibrated"
-  } else {
-    if ("y_pred_prob_raw" %in% names(df)) {
-      prob_col <- "y_pred_prob_raw"
+  # 概率列选择：
+  #   - Derivation 一律用 raw（apparent）：其 calibrated 概率是自身拟合 Platt 的
+  #     in-sample 输出，过度乐观，且与 05 主图口径不一致；
+  #   - 外部队列按 use_calibrated 选择（post = Platt 校准后，pre = 原始概率）。
+  if ("y_pred_prob_raw" %in% names(df)) {
+    df$prob_used <- if (use_calibrated) {
+      ifelse(df$Cohort == "Derivation", df$y_pred_prob_raw, df$y_pred_prob_calibrated)
     } else {
-      cat("  WARNING: y_pred_prob_raw not found, falling back to calibrated.\n")
-      prob_col <- "y_pred_prob_calibrated"
+      df$y_pred_prob_raw
     }
+  } else {
+    cat("  WARNING: y_pred_prob_raw not found, falling back to calibrated.\n")
+    df$prob_used <- df$y_pred_prob_calibrated
   }
+  prob_col <- "prob_used"
   
   # 计算 Brier Score（使用所选概率列）
   brier_scores <- df %>%
@@ -525,8 +553,12 @@ plot_calibration_curves <- function(model_name, use_calibrated = TRUE, file_suff
       .groups = "drop"
     )
   
+  # Derivation 的概率为 apparent（在其自身样本上产生/拟合），与 05 主图口径
+  # 一致，图例统一标注 "apparent raw"，避免与校准后口径混淆。
+  # 图例标签拆成两行，避免长文本在右侧超出画布被裁切
   brier_labels <- setNames(
-    sprintf("%s (Brier = %.3f)", brier_scores$Cohort, brier_scores$Brier),
+    sprintf("%s\n(Brier = %.3f%s)", brier_scores$Cohort, brier_scores$Brier,
+            ifelse(brier_scores$Cohort == "Derivation", ", apparent raw", "")),
     brier_scores$Cohort
   )
   
@@ -628,7 +660,7 @@ plot_calibration_curves <- function(model_name, use_calibrated = TRUE, file_suff
       plot.title = element_blank(),
       axis.title = element_text(size = FONT_LABEL),
       axis.text = element_text(size = FONT_TICK),
-      legend.position = c(0.85, 0.15),
+      legend.position = c(0.80, 0.18),
       legend.justification = c(0.5, 0.5),
       legend.background = element_rect(fill = "white", color = "gray80", linewidth = 0.3),
       legend.text = element_text(size = FONT_LEGEND - 1),
@@ -709,17 +741,16 @@ plot_dca_curves <- function(model_name, use_calibrated = TRUE, file_suffix = "")
     dat <- read.csv(fpath, stringsAsFactors = FALSE)
     y_true <- dat$y_true
     
-    # 根据 use_calibrated 参数选择概率列
-    if (use_calibrated) {
+    # 概率口径：Derivation 的 calibrated 概率由其在自身样本上拟合的 Platt
+    # 校准器输出（in-sample，过度乐观），故统一改用 raw 概率；文件缺 raw 列时
+    # 回退 calibrated 并警告。外部队列保持原 use_calibrated 口径。
+    if (use_calibrated && cohort$name != "Derivation") {
       y_pred <- dat$y_pred_prob_calibrated
+    } else if ("y_pred_prob_raw" %in% colnames(dat)) {
+      y_pred <- dat$y_pred_prob_raw
     } else {
-      # 校准前使用原始概率
-      if ("y_pred_prob_raw" %in% colnames(dat)) {
-        y_pred <- dat$y_pred_prob_raw
-      } else {
-        cat(sprintf("  WARNING: y_pred_prob_raw not found for %s, falling back to calibrated.\n", cohort$name))
-        y_pred <- dat$y_pred_prob_calibrated
-      }
+      cat(sprintf("  WARNING: y_pred_prob_raw not found for %s, falling back to calibrated.\n", cohort$name))
+      y_pred <- dat$y_pred_prob_calibrated
     }
     
     n <- length(y_true)
@@ -804,6 +835,10 @@ plot_dca_curves <- function(model_name, use_calibrated = TRUE, file_suffix = "")
     "Treat All (Geographical)" = 0.8, "Geographical" = 1.2
   )
   
+  # 图例标签：Derivation 曲线使用 apparent raw 概率（calibrated 为 in-sample，过度乐观）
+  strategy_labels <- ifelse(names(all_colors) == "Derivation",
+                            "Derivation (apparent raw)", names(all_colors))
+  
   # ---- 曲线同色填充区域：各队列模型 NB > max(Treat None=0, Treat All) 的临床价值区间 ----
   region_colors <- c(
     "Derivation"   = COL_DERIV,   # 蓝色
@@ -820,9 +855,11 @@ plot_dca_curves <- function(model_name, use_calibrated = TRUE, file_suffix = "")
   }))
   
   # ---- y 轴范围 ----
+  # 下限自适应「模型曲线」的最低净获益（硬编码 -0.15 会在低患病率队列把模型曲线截断）；
+  # Treat All 基准线在高阈值必然陡降，仍按惯例裁掉，不参与 y_lo 计算。
   max_nb <- max(dca_df$Net_Benefit, na.rm = TRUE)
   max_prev <- max(unlist(prev_list), na.rm = TRUE)
-  y_lo <- -0.15
+  y_lo <- min(-0.10, min(dca_df$Net_Benefit, na.rm = TRUE) - 0.02)
   y_hi <- max(max_nb, max_prev, na.rm = TRUE) * 1.05 + 0.02
   
   # 图例固定右上角，稍向下移位
@@ -837,14 +874,18 @@ plot_dca_curves <- function(model_name, use_calibrated = TRUE, file_suffix = "")
     geom_line(data = all_lines, aes(x = Threshold, y = Net_Benefit,
                                     color = Strategy, linetype = Strategy,
                                     linewidth = Strategy)) +
-    scale_color_manual(name = NULL, values = all_colors, breaks = names(all_colors)) +
+    scale_color_manual(name = NULL, values = all_colors, breaks = names(all_colors),
+                       labels = strategy_labels) +
     scale_linetype_manual(name = NULL, values = all_linetypes) +
     scale_linewidth_manual(name = NULL, values = all_sizes) +
-    scale_fill_manual(name = NULL, values = region_colors) +
+    scale_fill_manual(name = NULL, values = region_colors, breaks = names(region_colors),
+                      labels = ifelse(names(region_colors) == "Derivation",
+                                      "Derivation (apparent raw)", names(region_colors))) +
     coord_cartesian(xlim = c(0, 0.80), ylim = c(y_lo, y_hi)) +
     scale_x_continuous(limits = c(0, 0.80), breaks = seq(0, 0.8, by = 0.1),
                        labels = scales::label_number(accuracy = 0.1)) +
-    labs(x = "Threshold Probability", y = "Net Benefit") +
+    labs(x = "Threshold Probability", y = "Net Benefit",
+         caption = "Ideal (perfect) reference shown at Derivation prevalence only; each cohort's Treat-All baseline uses its own prevalence.") +
     guides(
       color = guide_legend(override.aes = list(linewidth = 1.2), order = 1),
       fill = guide_legend(override.aes = list(alpha = 0.35), order = 2),
@@ -853,12 +894,13 @@ plot_dca_curves <- function(model_name, use_calibrated = TRUE, file_suffix = "")
     theme_bw(base_size = FONT_LABEL, base_family = "sans") +
     theme(
       plot.title = element_blank(),
+      plot.caption = element_text(size = FONT_SMALL, hjust = 0),
       axis.title = element_text(size = FONT_LABEL),
       axis.text = element_text(size = FONT_TICK),
       legend.position = leg_pos,
       legend.justification = c(0.5, 0.5),
       legend.background = element_rect(fill = "white", color = "gray80", linewidth = 0.3),
-      legend.text = element_text(size = FONT_LEGEND - 2),
+      legend.text = element_text(size = FONT_LEGEND - 1),
       legend.key.size = unit(0.4, "cm"),
       legend.spacing.y = unit(0.02, "cm"),
       panel.grid.minor = element_blank(),
@@ -891,16 +933,18 @@ plot_dca_curves <- function(model_name, use_calibrated = TRUE, file_suffix = "")
 plot_continuous_nb <- function(model_name) {
   cat("[9/10] 绘制连续净收益曲线...\n")
   
-  # 强制使用 dcurves 包：安装后再次 require 确认，仍失败则中止并提示手动安装
-  if (!require("dcurves", quietly = TRUE)) {
+  # dcurves 用于净收益计算；缺失时不中止脚本，仅告警并走手工 NB 回退
+  has_dcurves <- suppressWarnings(require("dcurves", quietly = TRUE))
+  if (!has_dcurves) {
     cat("  dcurves not available, installing from CRAN...\n")
     tryCatch(
       install.packages("dcurves", repos = "https://cloud.r-project.org", quiet = TRUE),
       error = function(e) cat(sprintf("  dcurves installation error: %s\n", e$message))
     )
-    if (!require("dcurves", quietly = TRUE)) {
-      stop("R 包 dcurves 自动安装/加载失败，请手动执行 install.packages(\"dcurves\") 后重跑本脚本（连续净收益图强制要求 dcurves 计算）。")
-    }
+    has_dcurves <- suppressWarnings(require("dcurves", quietly = TRUE))
+  }
+  if (!has_dcurves) {
+    cat("  WARNING: dcurves not available — using manual net-benefit fallback.\n")
   }
   
   # pracma 用于梯形积分（已安装）
@@ -929,7 +973,18 @@ plot_continuous_nb <- function(model_name) {
     }
     dat <- read.csv(fpath, stringsAsFactors = FALSE)
     y_true <- dat$y_true
-    y_pred <- dat$y_pred_prob_calibrated
+    # 概率口径：Derivation 的 calibrated 概率为 in-sample（自身拟合 Platt 校准器），
+    # 统一改用 raw 概率；缺 raw 列时回退 calibrated 并警告。外部队列保持 calibrated。
+    if (cohort$name == "Derivation") {
+      if ("y_pred_prob_raw" %in% colnames(dat)) {
+        y_pred <- dat$y_pred_prob_raw
+      } else {
+        cat("  WARNING: y_pred_prob_raw not found for Derivation, falling back to calibrated.\n")
+        y_pred <- dat$y_pred_prob_calibrated
+      }
+    } else {
+      y_pred <- dat$y_pred_prob_calibrated
+    }
     n <- length(y_true)
     prevalence <- mean(y_true)
     
@@ -938,14 +993,21 @@ plot_continuous_nb <- function(model_name) {
     # 使用 dcurves::dca 计算净收益（从返回对象提取模型变量）
     # 注意：dcurves::dca 不接受 smooth/standardize 参数（此前版本误传导致
     # 全部回退手工计算），dcurves 的标准化在返回对象中体现。
-    dca_obj <- tryCatch(
-      dca(y_true ~ y_pred_prob_calibrated, data = dat,
-          thresholds = seq(0.01, 0.80, by = 0.01)),
-      error = function(e) {
-        cat(sprintf("  WARNING: dcurves::dca failed for %s: %s\n", cohort$name, e$message))
-        NULL
-      }
-    )
+    # 概率列已按队列口径选定（y_pred），而 dcurves 公式只能引用数据框列名，
+    # 故写入临时列 pred_for_dca（不覆盖原始概率列），保证 dca 调用可用。
+    dat$pred_for_dca <- y_pred
+    dca_obj <- if (!has_dcurves) {
+      NULL
+    } else {
+      tryCatch(
+        dca(y_true ~ pred_for_dca, data = dat,
+            thresholds = seq(0.01, 0.80, by = 0.01)),
+        error = function(e) {
+          cat(sprintf("  WARNING: dcurves::dca failed for %s: %s\n", cohort$name, e$message))
+          NULL
+        }
+      )
+    }
     
     if (!is.null(dca_obj)) {
       # dcurves 返回包含 model/all/none 三个变量的 tibble
@@ -963,7 +1025,7 @@ plot_continuous_nb <- function(model_name) {
         }
       } else {
         # 回退：手工计算（dcurves 返回行数与阈值网格不匹配时）
-        cat(sprintf("  !!! WARNING: %s 非dcurves结果，为手工回退计算（manual fallback），与强制使用dcurves的口径不一致，结果解读需谨慎 !!!\n",
+        cat(sprintf("  !!! WARNING: %s 非dcurves结果，为手工回退计算（manual fallback），与 dcurves 计算结果可能存在差异，结果解读需谨慎 !!!\n",
                     cohort$name))
         nb <- sapply(thresholds, function(t) {
           tp <- sum(y_pred >= t & y_true == 1)
@@ -974,7 +1036,7 @@ plot_continuous_nb <- function(model_name) {
       }
     } else {
       # 回退：手工计算（dcurves::dca 执行失败时）
-      cat(sprintf("  !!! WARNING: %s 非dcurves结果，为手工回退计算（manual fallback），与强制使用dcurves的口径不一致，结果解读需谨慎 !!!\n",
+      cat(sprintf("  !!! WARNING: %s 非dcurves结果，为手工回退计算（manual fallback），与 dcurves 计算结果可能存在差异，结果解读需谨慎 !!!\n",
                   cohort$name))
       nb <- sapply(thresholds, function(t) {
         tp <- sum(y_pred >= t & y_true == 1)
@@ -1027,9 +1089,10 @@ plot_continuous_nb <- function(model_name) {
   cohort_colors <- setNames(c(COL_DERIV, COL_TEMP, COL_GEO),
                             c("Derivation", "Temporal", "Geographical"))
   
-  # 图例标签（含 AUC-NB）
+  # 图例标签拆成两行（AUC-NB 单独一行），避免超长文本超出画布右缘
   legend_labels <- sapply(names(auc_info), function(n) {
-    sprintf("%s (AUC-NB = %.3f)", n, auc_info[n])
+    suffix <- if (n == "Derivation") " (apparent raw)" else ""
+    sprintf("%s%s\n(AUC-NB = %.3f)", n, suffix, auc_info[n])
   })
   
   all_lines <- rbind(
@@ -1111,7 +1174,7 @@ plot_continuous_nb <- function(model_name) {
       plot.title = element_blank(),
       axis.title = element_text(size = FONT_LABEL),
       axis.text = element_text(size = FONT_TICK),
-      legend.position = c(0.85, 0.88),
+      legend.position = c(0.80, 0.78),
       legend.justification = c(0.5, 0.5),
       legend.background = element_rect(fill = "white", color = "gray80", linewidth = 0.3),
       legend.text = element_text(size = FONT_LEGEND - 1),
@@ -1159,7 +1222,18 @@ plot_net_intervention_avoided <- function(model_name) {
     }
     dat <- read.csv(fpath, stringsAsFactors = FALSE)
     y_true <- dat$y_true
-    y_pred <- dat$y_pred_prob_calibrated
+    # 概率口径：Derivation 的 calibrated 概率为 in-sample（自身拟合 Platt 校准器），
+    # 统一改用 raw 概率；缺 raw 列时回退 calibrated 并警告。外部队列保持 calibrated。
+    if (cohort$name == "Derivation") {
+      if ("y_pred_prob_raw" %in% colnames(dat)) {
+        y_pred <- dat$y_pred_prob_raw
+      } else {
+        cat("  WARNING: y_pred_prob_raw not found for Derivation, falling back to calibrated.\n")
+        y_pred <- dat$y_pred_prob_calibrated
+      }
+    } else {
+      y_pred <- dat$y_pred_prob_calibrated
+    }
     n <- length(y_true)
     prev <- mean(y_true)
     prev_list[[cohort$name]] <- prev
@@ -1201,7 +1275,9 @@ plot_net_intervention_avoided <- function(model_name) {
   p <- ggplot(nia_df, aes(x = Threshold, y = NIA, color = Cohort)) +
     geom_line(linewidth = 1.2) +
     geom_hline(yintercept = 0, linetype = "dashed", color = "gray50", linewidth = 0.5) +
-    scale_color_manual(values = nia_colors) +
+    scale_color_manual(values = nia_colors,
+                       breaks = c("Derivation", "Temporal", "Geographical"),
+                       labels = c("Derivation (apparent raw)", "Temporal", "Geographical")) +
     coord_cartesian(xlim = c(0, 0.80), ylim = c(nia_y_lo, nia_y_hi)) +
     scale_x_continuous(limits = c(0, 0.80), breaks = seq(0, 0.8, by = 0.1),
                        labels = scales::label_number(accuracy = 0.1)) +
@@ -1237,11 +1313,10 @@ main <- function() {
   cat("  06_Clinical_Plots_R.R — SCI标准临床预测模型图表生成\n")
   cat("=", strrep("=", 76), "=\n", sep = "")
   
-  # 读取推荐模型
+  # 读取推荐模型（MLP 已从流水线移除，缺失时直接报错中止而非回退）
   model_name <- tryCatch(read_model_name(), error = function(e) {
     cat("  ERROR: ", e$message, "\n")
-    cat("  Using default: MLP\n")
-    return("MLP")
+    stop("无法确定推荐模型：", e$message, "（请先运行 04_Model_Selection.py 生成 model_selection_metrics.csv）")
   })
   
   cat(sprintf("Model: %s\n", model_name))
@@ -1268,12 +1343,8 @@ main <- function() {
            error = function(e) {
     cat("  ERROR in calibration curves (platt): ", e$message, "\n")
   })
-  # [5/10] 校准曲线（Intercept 补充图）
-  tryCatch(plot_calibration_curves(model_name, use_calibrated = TRUE,
-                                   file_suffix = "_intercept_recalibrated"),
-           error = function(e) {
-    cat("  ERROR in calibration curves (intercept): ", e$message, "\n")
-  })
+  # [5/10] 截距重校准补充图已取消：05 不再做截距重校准（需要外部队列自身结局，
+  # 属部分样本内拟合），故无 *_intercept_recalibrated.csv 输入，不再生成该套图。
   
   # [6/10] 决策曲线 DCA（Raw 主图）
   tryCatch(plot_dca_curves(model_name, use_calibrated = FALSE, file_suffix = ""),
@@ -1285,12 +1356,7 @@ main <- function() {
            error = function(e) {
     cat("  ERROR in DCA curves (platt): ", e$message, "\n")
   })
-  # [8/10] 决策曲线 DCA（Intercept 补充图）
-  tryCatch(plot_dca_curves(model_name, use_calibrated = TRUE,
-                           file_suffix = "_intercept_recalibrated"),
-           error = function(e) {
-    cat("  ERROR in DCA curves (intercept): ", e$message, "\n")
-  })
+  # [8/10] 截距重校准 DCA 补充图同上，已取消。
   
   # [9/10] 连续净收益曲线
   tryCatch(plot_continuous_nb(model_name), error = function(e) {
@@ -1317,20 +1383,16 @@ main <- function() {
     }
   }
   
-  # 校准曲线三套：Raw 主图 / Platt 补充图 / Intercept 补充图
+  # 校准曲线两套：Raw 主图 / Platt 补充图
   rename_to_final(paste0("Calibration_Curves_Pre_Calibration_", model_name),
                   paste0("Figure2_Main_Calibration_Raw_", model_name))
   rename_to_final(paste0("Calibration_Curves_", model_name),
                   paste0("eFigure1_Calibration_Platt_", model_name))
-  rename_to_final(paste0("Calibration_Curves_Intercept_", model_name),
-                  paste0("eFigure2_Calibration_Intercept_", model_name))
-  # DCA 三套：Raw 主图 / Platt 补充图 / Intercept 补充图
+  # DCA 两套：Raw 主图 / Platt 补充图
   rename_to_final(paste0("DCA_Curves_Pre_Calibration_", model_name),
                   paste0("Figure2_Main_DCA_Raw_", model_name))
   rename_to_final(paste0("DCA_Curves_", model_name),
                   paste0("eFigure1_DCA_Platt_", model_name))
-  rename_to_final(paste0("DCA_Curves_Intercept_", model_name),
-                  paste0("eFigure2_DCA_Intercept_", model_name))
   
   cat("\n")
   cat("=", strrep("=", 76), "=\n", sep = "")

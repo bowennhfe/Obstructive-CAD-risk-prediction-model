@@ -110,15 +110,11 @@ PREPROCESSING_OBJECTS_PATH = os.path.join(DATA_PREPROCESSING_DIR, 'preprocessing
 _preproc_objects = joblib.load(PREPROCESSING_OBJECTS_PATH)
 _raw_feature_names = _preproc_objects['final_feature_names']
 
-# Strip _1, _2, _scaled suffixes from feature names for cleaner output
+# Strip only the _scaled suffix from feature names for cleaner output
 def _strip_suffix(name):
-    """Remove _1, _2, _scaled suffixes from column/feature names."""
+    """Remove the _scaled suffix from column/feature names."""
     if name.endswith('_scaled'):
         return name[:-7]
-    elif name.endswith('_1'):
-        return name[:-2]
-    elif name.endswith('_2'):
-        return name[:-2]
     return name
 
 FINAL_FEATURE_NAMES = [_strip_suffix(n) for n in _raw_feature_names]
@@ -350,6 +346,9 @@ def correlation_filter(X, threshold=0.6):
       earlier in the original column order (fa), removes the later one (fb).
       This ensures deterministic results without introducing bias from the
       outcome variable (no data leakage).
+    - When two variables exceed |rho| > 0.6, the one appearing earlier in the
+      pre-specified variable list (from 01_data_preprocessing numeric_cols order)
+      is retained. No outcome variable is used — avoiding selection bias.
     - Returns filtered features and removal log
     """
     X_filtered = X.copy()
@@ -359,7 +358,7 @@ def correlation_filter(X, threshold=0.6):
         corr = X_filtered.corr(method='spearman')
         corr_arr = corr.values.copy()
         np.fill_diagonal(corr_arr, 0)
-        np.tril(corr_arr)[:] = 0
+        corr_arr[np.tril_indices_from(corr_arr)] = 0
         # 按绝对值判定：|rho| > threshold 即剔除（强负相关同样构成共线性）
         corr_abs = np.abs(corr_arr)
         max_corr_abs = corr_abs.max()

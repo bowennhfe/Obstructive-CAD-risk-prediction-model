@@ -7,7 +7,7 @@
 #           验证集上全面评估，生成论文所需的所有图表和统计检验。
 #           校准策略：Derivation / Temporal 使用 Derivation 拟合的 Platt 校准器；
 #           Geographical 使用「时间集校准」（Temporal 拟合的 Platt），
-#           与 07 前瞻验证完全一致；模型始终只在 Derivation 上训练。
+#           与 07 盲法验证完全一致；模型始终只在 Derivation 上训练。
 #   Part 2  亚组脆弱性分析（精确反标准化年龄 + ESC SCORE2 三分组 +
 #           Raw/Recalibrated 校准对比 + Brier 改善棒棒糖图），直接复用内存中的
 #           模型、校准器与各队列预测概率，不二次读盘。
@@ -45,7 +45,6 @@ from sklearn.tree import DecisionTreeClassifier
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.svm import SVC
 from sklearn.naive_bayes import GaussianNB
-from sklearn.neural_network import MLPClassifier
 from sklearn.metrics import (roc_auc_score, roc_curve, brier_score_loss,
                              accuracy_score, recall_score, precision_score,
                              f1_score, confusion_matrix, average_precision_score,
@@ -85,11 +84,11 @@ def _ensure_library(pip_name, import_name=None):
         ) from e
 
 # Ensure required libraries
-for lib in ["lightgbm", "catboost", "shap", "seaborn", "statsmodels"]:
+# lightgbm / catboost 改为按需导入：只有真正选用该模型时才要求安装，
+# 否则选择 L2_LR 等模型时缺库不应中断整个脚本。
+for lib in ["shap", "seaborn", "statsmodels"]:
     _ensure_library(lib)
 
-from lightgbm import LGBMClassifier
-from catboost import CatBoostClassifier
 import shap
 import seaborn as sns
 import statsmodels.api as sm
@@ -190,15 +189,6 @@ plt.rcParams.update({
 def _get_fixed_params(model_name):
     if model_name == "L2_LR":
         return {"solver": "lbfgs", "max_iter": 5000, "random_state": RANDOM_STATE}
-    elif model_name == "MLP":
-        return {
-            "max_iter": 2000,
-            "early_stopping": True,
-            "validation_fraction": 0.2,
-            "n_iter_no_change": 15,
-            "random_state": RANDOM_STATE,
-            "verbose": False
-        }
     elif model_name == "KNN":
         return {"n_jobs": N_JOBS}
     elif model_name == "DT":
@@ -239,8 +229,6 @@ def build_model(model_name, params):
         if merged.get("penalty") in ("l1", "elasticnet") and merged.get("max_iter", 5000) < 10000:
             merged["max_iter"] = 10000
         return LogisticRegression(**merged)
-    elif model_name == "MLP":
-        return MLPClassifier(**merged)
     elif model_name == "KNN":
         return KNeighborsClassifier(**merged)
     elif model_name == "DT":
@@ -248,8 +236,12 @@ def build_model(model_name, params):
     elif model_name == "RF":
         return RandomForestClassifier(**merged)
     elif model_name == "LightGBM":
+        _ensure_library("lightgbm")
+        from lightgbm import LGBMClassifier
         return LGBMClassifier(**merged)
     elif model_name == "CatBoost":
+        _ensure_library("catboost")
+        from catboost import CatBoostClassifier
         return CatBoostClassifier(**merged)
     elif model_name == "SVM":
         return SVC(**merged)
@@ -519,12 +511,15 @@ def save_figure(fig, base_name, result_dir=RESULT_DIR):
 # Plot 1: ROC Curves (Dynamic Cohorts)
 # =============================================================================
 def plot_roc_curves(preds_dict, model_name, result_dir, nested_cv_auc=None, nested_cv_ci_lower=None, nested_cv_ci_upper=None):
-    """ROC curves for all available cohorts, with BCa AUC in legend.
+    """ROC curves for all available cohorts.
 
     图-表同源：Derivation 曲线使用 04 脚本 nested-CV OOF 原始概率绘制，
-    图例标注 nested-CV AUC（与 final_model_summary.csv 的
-    Optimism-Corrected (Nested-CV) 行一致）；外部队列使用校准后概率，
-    图例 AUC 由绘图概率直接计算（与 Recalibrated 行一致）。
+    图例标注的 nested-CV AUC 与 final_model_summary.csv 的
+    Optimism-Corrected (Nested-CV) 行一致（= N_REPEATS 次重复的均值，
+    CI 为 均值 ± 1.96×重复级 SE，非 bootstrap 区间）。
+    注：04 导出的 OOF 文件为 repeat 1 的代表性 OOF，故曲线本身来自第 1 次重复，
+    其 AUC 与图例的 10 次重复均值可能相差千分位——图标题已注明曲线来源。
+    外部队列使用校准后概率，图例 AUC 由绘图概率直接计算（BCa bootstrap CI）。
     """
     # 固定队列顺序的色盲友好配色
     def _cohort_color(cohort, idx):
@@ -556,7 +551,8 @@ def plot_roc_curves(preds_dict, model_name, result_dir, nested_cv_auc=None, nest
             ci_low = nested_cv_ci_lower if nested_cv_ci_lower is not None else np.nan
             ci_high = nested_cv_ci_upper if nested_cv_ci_upper is not None else np.nan
             if not np.isnan(ci_low) and not np.isnan(ci_high):
-                label = f"{cohort} (Nested-CV AUC={auc_mean:.3f}, 95% CI {ci_low:.3f}-{ci_high:.3f})"
+                label = (f"{cohort} (Nested-CV AUC={auc_mean:.3f}, "
+                         f"95% CI {ci_low:.3f}-{ci_high:.3f}; mean±1.96SE over repeats)")
             else:
                 label = f"{cohort} (Nested-CV AUC={auc_mean:.3f})"
         else:
@@ -571,7 +567,9 @@ def plot_roc_curves(preds_dict, model_name, result_dir, nested_cv_auc=None, nest
     ax.set_ylim([-0.02, 1.02])
     ax.set_xlabel("1 - Specificity")
     ax.set_ylabel("Sensitivity")
-    ax.set_title(f"ROC Curves — {model_name}")
+    ax.set_title(f"ROC Curves — {model_name}\n"
+                 f"(Derivation curve: repeat 1 OOF; AUC label: repeat-level mean)",
+                 fontsize=10)
     ax.legend(loc="lower right", frameon=True)
     ax.grid(True, alpha=0.3)
 
@@ -582,11 +580,13 @@ def plot_roc_curves(preds_dict, model_name, result_dir, nested_cv_auc=None, nest
 # =============================================================================
 # Plot 1a: Derivation Optimism (Apparent vs Nested-CV AUC)
 # =============================================================================
-def plot_derivation_optimism(clf, X_train_scaled, y_train, oof_y_prob, oof_y_true, model_name, result_dir):
+def plot_derivation_optimism(clf, X_train_scaled, y_train, oof_y_prob, oof_y_true, model_name, result_dir,
+                             nested_cv_auc=None, nested_cv_ci_lower=None, nested_cv_ci_upper=None):
     """Visualize optimism in Derivation AUC (Apparent vs Nested-CV).
 
-    Compares the final model's Apparent AUC (on full training set) with the
-    Nested-CV AUC from 04_Model_Selection.py. Optimism = Apparent - Nested-CV.
+    图例中的 Nested-CV AUC 优先取 final_model_summary.csv 报告值（repeat-level
+    均值 ± 1.96×重复级 SE）；曲线本身用 04 导出的 repeat 1 代表性 OOF 绘制。
+    两者可能相差千分位，图标题已注明曲线来源。
 
     Args:
         clf: Trained final model.
@@ -596,6 +596,9 @@ def plot_derivation_optimism(clf, X_train_scaled, y_train, oof_y_prob, oof_y_tru
         oof_y_true: OOF true labels from 04 (same length as oof_y_prob).
         model_name: Model name string.
         result_dir: Output directory.
+        nested_cv_auc: Report-level nested-CV AUC (repeat mean); falls back to OOF AUC.
+        nested_cv_ci_lower: Lower bound (mean - 1.96*repeat SE).
+        nested_cv_ci_upper: Upper bound (mean + 1.96*repeat SE).
     """
     # Length consistency check
     if len(oof_y_prob) != len(oof_y_true):
@@ -611,14 +614,24 @@ def plot_derivation_optimism(clf, X_train_scaled, y_train, oof_y_prob, oof_y_tru
     oof_auc = roc_auc_score(oof_y_true, oof_y_prob)
     fpr_app, tpr_app, _ = roc_curve(y_train, apparent_prob)
 
-    optimism = apparent_auc - oof_auc
+    # 图例数值优先用报告值（repeat-level 均值），与 final_model_summary.csv 一致；
+    # 曲线本身仍来自 repeat 1 代表性 OOF。
+    reported_auc = nested_cv_auc if nested_cv_auc is not None else oof_auc
+    if nested_cv_ci_lower is not None and nested_cv_ci_upper is not None:
+        oof_label = (f"Nested-CV AUC = {reported_auc:.3f}\n"
+                     f"(95% CI {nested_cv_ci_lower:.3f}-{nested_cv_ci_upper:.3f}; "
+                     f"mean±1.96SE over repeats)")
+    else:
+        oof_label = f"Nested-CV AUC = {reported_auc:.3f}"
+
+    optimism = apparent_auc - reported_auc
     optimism_pct = optimism * 100
 
     # Plot
     fig, ax = plt.subplots(figsize=(6, 6))
     # Nested-CV ROC
     ax.plot(fpr_oof, tpr_oof, color="#1F77B4", lw=2.0, linestyle="-",
-            label=f"Nested-CV AUC = {oof_auc:.3f}")
+            label=oof_label)
     # Apparent ROC
     ax.plot(fpr_app, tpr_app, color="#D62728", lw=2.0, linestyle="--",
             label=f"Apparent AUC = {apparent_auc:.3f}")
@@ -632,7 +645,8 @@ def plot_derivation_optimism(clf, X_train_scaled, y_train, oof_y_prob, oof_y_tru
     ax.set_ylim([0.0, 1.0])
     ax.set_xlabel("1 - Specificity (False Positive Rate)", fontsize=11)
     ax.set_ylabel("Sensitivity (True Positive Rate)", fontsize=11)
-    ax.set_title(f"Apparent vs Nested-CV AUC — {model_name}\n(Derivation Set)",
+    ax.set_title(f"Apparent vs Nested-CV AUC — {model_name}\n"
+                 f"(Derivation Set; Nested-CV curve = repeat 1 OOF)",
                  fontsize=12, fontweight="bold")
     ax.legend(loc="lower right", fontsize=10, framealpha=0.95)
     ax.grid(True, alpha=0.25, linestyle="--")
@@ -667,10 +681,13 @@ def plot_pr_curves(preds_dict, metrics_dict, model_name, result_dir, preds_dict_
         auprc = m.get("AUPRC", average_precision_score(y_true, y_prob))
         auprc_lo = m.get("AUPRC_CI_Lower", np.nan)
         auprc_hi = m.get("AUPRC_CI_Upper", np.nan)
+        # Derivation 曲线与 AUPRC 均为 raw apparent 口径（PR 曲线对概率平移不敏感，
+        # 与 ROC 的 nested-CV 口径不同），图例需显式标注以免与 ROC 图混淆。
+        tag = f"{cohort} (apparent)" if cohort == "Derivation" else cohort
         if not np.isnan(auprc_lo) and not np.isnan(auprc_hi):
-            label = f"{cohort} (AUPRC={auprc:.3f}, {auprc_lo:.3f}-{auprc_hi:.3f})"
+            label = f"{tag} (AUPRC={auprc:.3f}, {auprc_lo:.3f}-{auprc_hi:.3f})"
         else:
-            label = f"{cohort} (AUPRC={auprc:.3f})"
+            label = f"{tag} (AUPRC={auprc:.3f})"
 
         precision, recall, _ = precision_recall_curve(y_true, y_prob)
         ax.plot(recall, precision, lw=1.8, color=colors[cohort], label=label)
@@ -683,7 +700,9 @@ def plot_pr_curves(preds_dict, metrics_dict, model_name, result_dir, preds_dict_
     ax.set_ylim([-0.02, 1.02])
     ax.set_xlabel("Recall (Sensitivity)")
     ax.set_ylabel("Precision")
-    ax.set_title(f"Precision-Recall Curves — {model_name}")
+    ax.set_title(f"Precision-Recall Curves — {model_name}\n"
+                 f"Derivation PR drawn on apparent (in-sample) probabilities; "
+                 f"see final_model_summary.csv for nested-CV AUPRC.", fontsize=10)
     ax.legend(loc="lower left", frameon=True)
     ax.grid(True, alpha=0.3)
 
@@ -728,7 +747,11 @@ def plot_calibration_curves(preds_dict, preds_dict_raw, model_name, hl_results, 
         brier_val = brier_score_loss(y_true, y_prob)
         # Derivation 为 apparent raw 口径，图例明确标注
         cohort_tag = f"{cohort} (apparent)" if cohort == "Derivation" else cohort
-        label = f"{cohort_tag} (Brier={brier_val:.3f}, HL p={hl_p:.3f})" if not np.isnan(hl_p) else f"{cohort_tag} (Brier={brier_val:.3f})"
+        # 外部队列曲线用 calibrated 概率（Brier 同口径），而 HL 检验固定基于 raw 概率，
+        # 图例必须标注 "(raw)"，避免读者误以为两者同一口径。
+        hl_tag = "HL p" if cohort == "Derivation" else "HL p(raw)"
+        label = (f"{cohort_tag} (Brier={brier_val:.3f}, {hl_tag}={hl_p:.3f})"
+                 if not np.isnan(hl_p) else f"{cohort_tag} (Brier={brier_val:.3f})")
 
         # Recalibrated: solid line with filled markers
         ax.plot(prob_pred, prob_true, "o-", color=colors[cohort], markersize=6,
@@ -864,7 +887,7 @@ def plot_shap(clf, X_train, feature_names, model_name, result_dir):
                     # 新版 SHAP 对二分类树模型返回 (n, n_features, 2) 3D 数组，取正类
                     shap_values = shap_values[:, :, 1]
             else:
-                # KernelExplainer fallback for other models (MLP, SVM, KNN, GaussianNB)
+                # KernelExplainer fallback for other models (SVM, KNN, GaussianNB)
                 background = shap.kmeans(X_train, min(50, X_train.shape[0]))
                 explainer = shap.KernelExplainer(
                     lambda x: clf.predict_proba(x)[:, 1], background
@@ -1042,7 +1065,8 @@ def plot_feature_importance(clf, feature_names, model_name, X_train, y_train, re
     ax.axvline(x=1.0, color="red", linestyle="--", lw=1.0, alpha=0.7)
     ax.set_yticks(y_pos)
     ax.set_yticklabels(feat_sorted)
-    ax.set_xlabel("Odds Ratio (95% CI)")
+    ax.set_xlabel("Odds Ratio (95% CI)\nOR per 1 IQR increase (features are RobustScaler-transformed)",
+                  fontsize=10)
     ax.set_title(f"Odds Ratios — {model_name}")
     ax.grid(True, alpha=0.3)
     fig.tight_layout()
@@ -1343,7 +1367,9 @@ def plot_confusion_matrices(preds_dict, model_name, cutoff, result_dir, nested_c
         axes[i].set_xlabel("Predicted")
         axes[i].set_ylabel("Actual")
 
-    fig.suptitle(f"Confusion Matrices — {model_name} (Derivation raw cutoff={cutoff_raw:.3f})",
+    fig.suptitle(f"Confusion Matrices — {model_name}\n"
+                 f"Derivation: raw cutoff={cutoff_raw:.3f}; "
+                 f"Temporal/Geographical: recalibrated cutoff",
                  fontsize=FONT_TITLE + 1)
     fig.tight_layout()
     save_figure(fig, f"confusion_matrices_{model_name}", result_dir)
@@ -1462,12 +1488,15 @@ def plot_auprc_gain_bar(metrics_dict, preds_dict, model_name, result_dir):
 # =============================================================================
 # Brier Skill Score Plot
 # =============================================================================
-def plot_brier_skill_score(metrics_dict, preds_dict, model_name, result_dir):
+def plot_brier_skill_score(metrics_dict, preds_dict, model_name, result_dir, preds_dict_raw=None):
     """Horizontal dot plot of Brier Skill Score with 95% CI for 3 cohorts.
 
     BSS = 1 - (Model Brier / Null Brier), where Null Brier = prevalence * (1 - prevalence).
     BSS > 0 means the model improves upon random guessing.
     Bootstrapped 95% CI reflects sampling uncertainty.
+
+    Derivation 点估计取 metrics_dict 的 raw apparent Brier，故其 bootstrap 也必须
+    用 raw 概率（preds_dict_raw），否则 CI 会围绕一个不同口径的 Brier 展开。
     """
     cohort_order = ["Derivation", "Temporal", "Geographical"]
     available = [c for c in cohort_order if c in metrics_dict and "Brier" in metrics_dict[c]
@@ -1488,6 +1517,9 @@ def plot_brier_skill_score(metrics_dict, preds_dict, model_name, result_dir):
 
     for cohort in available:
         y_true, y_prob = preds_dict[cohort]
+        # Derivation 的 Brier 点估计为 raw apparent 口径 → bootstrap 也用 raw 概率
+        if cohort == "Derivation" and preds_dict_raw is not None and cohort in preds_dict_raw:
+            y_true, y_prob = preds_dict_raw[cohort]
         n = len(y_true)
         prevalence = np.mean(y_true)
         prevalence_vals[cohort] = prevalence
@@ -1898,7 +1930,7 @@ def plot_individual_shap_force(clf, X_train, feature_names, model_name,
                          alpha=0.9))
 
         # --- 样式 ---
-        ax.set_xlabel("SHAP value (log-odds)", fontsize=9)
+        ax.set_xlabel("SHAP value (log-odds; x-axis in RobustScaler units)", fontsize=9)
         ax.set_title(f"{all_categories[idx]} predicted probability",
                      fontsize=10, fontweight="bold")
         ax.grid(axis='x', alpha=0.3, linestyle='--')
@@ -1995,6 +2027,13 @@ if os.path.exists(selection_metrics_path):
             "PPV": row["PPV"].values[0],
             "NPV": row["NPV"].values[0],
             "Optimal_Cutoff": row["Optimal_Cutoff"].values[0],
+            # 重复嵌套 CV 新增列（缺失时回退 NaN，兼容旧版 04 输出）
+            "AUC_SE": (row["AUC_SE"].values[0] if "AUC_SE" in row.columns else np.nan),
+            "AUC_SD": (row["AUC_SD"].values[0] if "AUC_SD" in row.columns else np.nan),
+            "AUC_N_ValidRepeats": (row["AUC_N_ValidRepeats"].values[0]
+                                   if "AUC_N_ValidRepeats" in row.columns else np.nan),
+            "Optimal_Cutoff_SD": (row["Optimal_Cutoff_SD"].values[0]
+                                  if "Optimal_Cutoff_SD" in row.columns else np.nan),
         }
         print(f"  Loaded metrics for {model_name}: AUC={nested_cv_metrics['AUC']:.3f}")
 else:
@@ -2088,7 +2127,7 @@ if model_name in ("L2_LR",):
 
 # --- Predictions (校准策略) ---
 # Step 3a: Derivation 校准器（Platt，仅在 Derivation 上拟合），用于 Derivation 与 Temporal。
-# Step 3b: 地理外部验证集改用「时间集校准」——与 08 前瞻验证完全一致的做法：
+# Step 3b: 地理外部验证集改用「时间集校准」——与 07 盲法验证完全一致的做法：
 #          模型仍只在 Derivation 上训练，Temporal 仅用于拟合重校准器，
 #          再将该校准器应用于 Geographical 队列（不做任何重训）。
 # preds_dict_raw 始终保存未校准的原始概率，用于 Raw vs Recalibrated 对比。
@@ -2129,9 +2168,10 @@ final_cutoff_logit = np.log(np.clip(final_cutoff, 1e-6, 1 - 1e-6) / (1 - np.clip
 final_cutoff_calibrated = calib_model.predict_proba(np.array([[final_cutoff_logit]]))[:, 1][0]
 print(f"  Calibrated cutoff for recalibrated probabilities: {final_cutoff_calibrated:.4f}")
 
-# Step 3b: 地理外部验证集 —— 用 Temporal 拟合的校准器（与 08 前瞻验证口径一致）
+# Step 3b: 地理外部验证集 —— 用 Temporal 拟合的校准器（与 07 盲法验证口径一致）
 # 说明：Temporal 在本策略中仅贡献 2 个校准参数（斜率/截距），不参与训练、特征选择与标准化；
 #       地理队列全程不参与训练或校准器拟合，仍为独立外部验证集。
+# ⚠️ 方法学注意：Geographical 校准器由 Temporal 结局拟合，其校准后概率间接依赖 Temporal 结局；若论文要称其"完全独立"，应改用 Derivation 校准器。
 geo_calibrator = None
 final_cutoff_geo = final_cutoff_calibrated
 if has_geo and has_temporal:
@@ -2274,6 +2314,7 @@ row_der_app = {"Cohort": "Derivation", "Model": model_name, "Calibration_Status"
                "AUC_Estimation": "Bootstrap mean (apparent, raw probs)"}
 row_der_app.update(m_apparent_der)
 row_der_app["Apparent_AUC"] = m_apparent_der["AUC"]
+row_der_app["Cutoff_Source"] = "raw (Derivation nested-CV median)"
 summary_rows.append(row_der_app)
 
 # 2. Derivation Optimism-Corrected 行 (使用 nested-CV AUC + 原始Brier)
@@ -2281,7 +2322,8 @@ if nested_cv_metrics:
     row_der_cv = {"Cohort": "Derivation", "Model": model_name, "Calibration_Status": "Optimism-Corrected (Nested-CV)",
                   "AUC_Estimation": "Nested-CV (from 04_Model_Selection.py)"}
     row_der_cv.update(nested_cv_metrics)
-    # Brier 用 apparent 的 Brier（因为 nested-CV 的 Brier 未存储）
+    # Brier 沿用 apparent 的 Brier（该行其余指标为 nested-CV 口径；04 自 v3 起
+    # 也提供重复级 Brier，但为使本行与外部队列行的 Brier 定义一致，仍取 apparent）
     row_der_cv["Brier"] = m_apparent_der.get("Brier", np.nan)
     # AUPRC（nested-CV 口径）：从 04 的 OOF 预测用 bootstrap_auprc_ci 计算，补齐该行缺失的 AUPRC 及 95%CI
     oof_path_sum = os.path.join(SELECTION_DIR, "oof_predictions_all_models.csv")
@@ -2300,6 +2342,13 @@ if nested_cv_metrics:
         except Exception as e:
             print(f"  WARNING: nested-CV AUPRC 计算失败 ({e})，该行 AUPRC 留空。")
     row_der_cv["Apparent_AUC"] = apparent_auc
+    # 该行各指标口径不同，CSV 内显式标注来源，避免读者误以为全部为 nested-CV 口径：
+    #   AUC + CI  = 重复级均值 ± 1.96×重复级 SE（04）
+    #   Brier     = raw apparent（与外部验证行同定义）
+    #   AUPRC     = repeat 1 代表性 OOF 的 BCa bootstrap
+    row_der_cv["Brier_Source"] = "raw apparent"
+    row_der_cv["AUPRC_Source"] = "repeat-1 OOF bootstrap (BCa)"
+    row_der_cv["Cutoff_Source"] = "raw (Derivation nested-CV median)"
     summary_rows.append(row_der_cv)
 
 # 3. 外部验证集: 校准后 (Recalibrated) + 原始 (Raw)
@@ -2311,6 +2360,7 @@ for cohort in preds_dict:
                "AUC_Estimation": "Bootstrap mean (calibrated probs)"}
     row_cal.update(m)
     row_cal["Apparent_AUC"] = m["AUC"]
+    row_cal["Cutoff_Source"] = "mapped via Platt (or Derivation calibrator)"
     summary_rows.append(row_cal)
 
     if cohort in metrics_dict_raw:
@@ -2319,9 +2369,13 @@ for cohort in preds_dict:
                    "AUC_Estimation": "Bootstrap mean (raw probs)"}
         row_raw.update(m_raw)
         row_raw["Apparent_AUC"] = m_raw["AUC"]
+        row_raw["Cutoff_Source"] = "raw (Derivation nested-CV median)"
         summary_rows.append(row_raw)
 
 summary_df = pd.DataFrame(summary_rows)
+# 列名统一为 Applied_Cutoff：本表记录的是「实际施加于该队列的阈值」，
+# 与 04 的 Optimal_Cutoff（Derivation 重复级中位数）区分，避免读者误读。
+summary_df = summary_df.rename(columns={"Optimal_Cutoff": "Applied_Cutoff"})
 summary_csv = os.path.join(RESULT_DIR, "final_model_summary.csv")
 summary_df.to_csv(summary_csv, index=False, float_format='%.6f')
 print(f"\n  Final summary saved: {summary_csv}")
@@ -2331,10 +2385,11 @@ print(f"\n  Final summary saved: {summary_csv}")
 # =========================================================================
 # 说明：Derivation 校准器（Platt，penalty=None）仅在 Derivation 上拟合，用于
 # Derivation 与 Temporal；地理队列改用「时间集校准」，即用 Temporal 拟合的
-# 校准器（斜率+截距，2 个参数）重新映射地理队列的原始概率，与 08 前瞻验证
+# 校准器（斜率+截距，2 个参数）重新映射地理队列的原始概率，与 07 盲法验证
 # 完全一致。任何外部队列的标签都不参与模型训练，不产生数据泄漏。
-# 不对外部验证集做"截距重校准"（用外部集自身标签拟合，属泄漏），因此不生成
-# *_intercept_recalibrated.csv 文件。
+# External validation reports only Raw (Table 2) and Platt (eTable 1) metrics. Intercept
+# recalibration is NOT performed because it uses the external cohort's own labels and would
+# constitute partial in-sample fitting.
 
 # --- Save Prediction Probabilities ---
 for cohort in preds_dict.keys():
@@ -2483,7 +2538,10 @@ try:
         if len(nested_cv_df_opt) == len(y_train):
             oof_y_prob = nested_cv_df_opt["y_pred_prob"].values
             oof_y_true = nested_cv_df_opt["y_true"].values
-            plot_derivation_optimism(clf, X_train_scaled, y_train, oof_y_prob, oof_y_true, model_name, RESULT_DIR)
+            plot_derivation_optimism(clf, X_train_scaled, y_train, oof_y_prob, oof_y_true, model_name, RESULT_DIR,
+                                     nested_cv_auc=nested_cv_metrics.get("AUC"),
+                                     nested_cv_ci_lower=nested_cv_metrics.get("AUC_CI_Lower"),
+                                     nested_cv_ci_upper=nested_cv_metrics.get("AUC_CI_Upper"))
         else:
             print(f"  WARNING: OOF length {len(nested_cv_df_opt)} != y_train length {len(y_train)}, skipping.")
     else:
@@ -2586,7 +2644,8 @@ except Exception as e:
 # Supplementary: Brier Skill Score
 print("\n[12/12] Brier Skill Score")
 try:
-    plot_brier_skill_score(metrics_dict, preds_dict, model_name, RESULT_DIR)
+    plot_brier_skill_score(metrics_dict, preds_dict, model_name, RESULT_DIR,
+                           preds_dict_raw=preds_dict_raw)
 except Exception as e:
     print(f"  ERROR: {e}")
 
@@ -2610,10 +2669,11 @@ report_lines.append(f"Best Parameters: {best_params}")
 if model_formula:
     report_lines.append(f"Model Formula: {model_formula}")
 report_lines.append("")
-report_lines.append("Note: Derivation cohort uses nested-CV AUC from 04_Model_Selection.py, while the remaining derivation metrics are raw apparent estimates.")
+report_lines.append("Note: Derivation row in final_model_summary.csv is mixed-口径: AUC+CI = repeat-mean ± 1.96×repeat-SE (04); Sensitivity/Specificity/Accuracy/F1/PPV/NPV/Applied_Cutoff = repeat-level mean (Applied_Cutoff = median of repeat-level cutoffs); Brier = raw apparent (see Brier_Source); AUPRC = repeat-1 OOF BCa (see AUPRC_Source). 各行实际施加的阈值来源见 Cutoff_Source 列.")
 report_lines.append("External validation sets report both Raw (uncalibrated) and Recalibrated metrics.")
-report_lines.append("Unified calibration: a single Platt-scaling calibrator (Logistic, penalty=None) was fit on Derivation")
-report_lines.append("and applied to all cohorts, ensuring internal/external calibration is on the same scale.")
+report_lines.append("Calibration: Derivation and Temporal use the Platt scaler (Logistic, penalty=None) fit on Derivation;")
+report_lines.append("Geographical uses the calibrator fit on Temporal (same as 07 blinded validation), so its")
+report_lines.append("calibrated probabilities depend indirectly on Temporal outcomes (see methodological note in code).")
 report_lines.append("")
 
 # --- TRIPOD Reporting Elements ---
@@ -2719,60 +2779,89 @@ report_lines.append("-" * 50)
 for r in hl_rows:
     report_lines.append(f"  {r['Cohort']}: Chi2={r['Chi2']:.3f}, df={r['DF']}, p={r['P_Value']:.3f}")
 
+report_lines.append("")
+report_lines.append("-" * 50)
+report_lines.append("AUC CI 口径说明 (final_model_summary.csv)")
+report_lines.append("-" * 50)
+report_lines.append(
+    "  Derivation / Optimism-Corrected (Nested-CV) 行的 95% CI = 重复嵌套 CV 的"
+    "重复级经验标准误（均值 ± 1.96·SE，SE = SD(重复级 OOF AUC)/sqrt(N_REPEATS)），")
+report_lines.append(
+    "  反映对外层数据划分的敏感性，属经验标准误而非严格抽样置信区间。")
+report_lines.append(
+    "  外部队列（Temporal / Geographical, Raw 或 Recalibrated）行的 95% CI = BCa"
+    " bootstrap（1000 次重抽 + jackknife），反映样本抽样不确定性。")
+report_lines.append(
+    "  两类区间含义不同，不可直接横向比较区间宽度；Applied_Cutoff（原 Optimal_Cutoff）"
+    "为重复级中位数，各行实际施加的阈值来源见 Cutoff_Source 列。")
+report_lines.append(
+    "  Derivation / Optimism-Corrected 行的 AUPRC 及 95% CI = 对 04 导出的 repeat 1"
+    "代表性 OOF 做 BCa bootstrap（非重复级均值），与 AUC 的重复级口径不同。")
+report_lines.append(
+    "  该 95% CI 为重复嵌套 CV 的重复级经验标准误（均值 ± 1.96×SE），反映外层数据划分的"
+    "敏感性，并非严格意义上的抽样置信区间；外部队列采用 BCa bootstrap（反映样本抽样"
+    "不确定性），两者含义不同，不可横向比较区间宽度。")
+
+report_lines.append("")
+report_lines.append("-" * 50)
+report_lines.append("基于 TRIPOD+AI 声明（Collins et al., BMJ 2024;384:e078378）的条目域整理；")
+report_lines.append("正式投稿前请对照期刊要求逐条核对编号与顺序。")
+report_lines.append("TRIPOD+AI checklist coverage (script-level; 编号按条目域)")
+report_lines.append("-" * 50)
+for _ln in [
+    "  3  数据来源/参与者        Covered      01_data_preprocessing.py（队列校验与描述统计）",
+    "  4  预测因子               Covered      02_vif_analysis.py（相关性/VIF）+ 03_feature_selection.R（4 方法共识）",
+    "  5  结局定义               Covered      01（label）; 05 报告事件数与患病率",
+    "  6  样本量/EPV             Partially    仅报告 EPV 经验值，未做正式功效计算",
+    "  7  缺失数据               Covered      01（mFIM 迭代插补，折内重放）",
+    "  8  模型开发与调参         Covered      04_Model_Selection.py（Optuna 嵌套调参）",
+    "  9  内部验证（乐观度）      Covered      04 重复嵌套 CV（10×5，外层独立重放全链路）",
+    "  10 外部验证               Covered      05（Temporal/Geographical Raw+Platt）、07（盲法队列）",
+    "  11 校准                   Covered      05/06（校准曲线、Slope/Intercept、Hosmer-Lemeshow、Brier）",
+    "  12 判别性能               Covered      05/06（ROC、AUPRC、DCA、混淆矩阵）",
+    "  13 AI 可解释性            Covered      05（SHAP summary/dependence + OR 森林图）",
+    "  14 AI 公平性/亚组          Covered      05 Part 2（年龄/性别/HTN 亚组脆弱性）",
+    "  15 可复现性               Partially    固定随机种子与 run_meta.txt；仍依赖本地 R/Python 环境",
+    "  16 标题/摘要/讨论/注册/资金  Not in scripts（手稿层面内容，本流水线不生成）",
+]:
+    report_lines.append(_ln)
+
+report_lines.append("")
+report_lines.append("-" * 50)
+report_lines.append("STARD-AI checklist coverage (script-level)")
+report_lines.append("-" * 50)
+for _ln in [
+    "  1  研究目的与设计          Covered      本流水线的诊断/预后准确性评估框架",
+    "  2  参与者纳入/排除        Covered      01_data_preprocessing.py",
+    "  3  指标定义与参考标准      Covered      label 定义 + Derivation 重复级阈值（Applied_Cutoff）",
+    "  4  样本量与事件数          Covered      05 报告 N/events/prevalence",
+    "  5  数据处理与无泄漏        Covered      折内重放（log1p→插补→标准化→VIF→共识选择），见 04 bias_note",
+    "  6  判别与校准              Covered      ROC/AUPRC/Brier/校准曲线/HL",
+    "  7  决策阈值与临床效用      Covered      06 DCA / CNB / NIA",
+    "  8  亚组与敏感性分析        Covered      05 Part 2；05b_NRI_IDI_Analysis.py",
+    "  9  局限性/注册/资金来源    Not in scripts（手稿层面内容）",
+]:
+    report_lines.append(_ln)
+
 report_path = os.path.join(RESULT_DIR, "model_report.txt")
 with open(report_path, "w", encoding="utf-8") as f:
     f.write("\n".join(report_lines))
 print(f"  Report saved: {report_path}")
 
 # =============================================================================
-# 论文输出表格：外部验证集三套性能指标（Table 2 / eTable 1 / eTable 2）
+# 论文输出表格：外部验证集两套性能指标（Table 2 / eTable 1）
 # =============================================================================
 # 说明：
 #   - Table2_Main_Raw_Validation.csv    : Raw（原始概率）外部验证集性能 —— 主正文 Table 2
-#   - eTable1_Platt_Validation.csv      : Platt（单一校准器，仅 Derivation 拟合）—— 补充 eTable 1
-#   - eTable2_Intercept_Validation.csv  : Intercept（截距重校准，calibration-in-the-large）—— 补充 eTable 2
-# 截距重校准仅在外部验证集上进行（斜率固定为 1，仅重估截距），用于评估
-# 校准水平的敏感性分析；Derivation 不做截距重校准（其校准器即在其上拟合）。
+#   - eTable1_Platt_Validation.csv      : Platt（Derivation 拟合的校准器）—— 补充 eTable 1
+# External validation reports only Raw (Table 2) and Platt (eTable 1) metrics. Intercept
+# recalibration is NOT performed because it uses the external cohort's own labels and would
+# constitute partial in-sample fitting.
 # =============================================================================
-
-def _youden_cutoff(y_true, y_prob):
-    """自行计算 Youden 最优阈值（J = TPR - FPR 最大化）。"""
-    fpr, tpr, thresholds = roc_curve(y_true, y_prob)
-    youden_j = tpr - fpr
-    best_idx = np.argmax(youden_j)
-    cutoff = thresholds[best_idx] if len(thresholds) > 0 else 0.5
-    # roc_curve 返回的首个阈值为 inf（sklearn 约定），非有限值回退 0.5
-    if not np.isfinite(cutoff):
-        cutoff = 0.5
-    return cutoff
 
 EXTERNAL_COHORT_KEYS = ["Temporal", "Geographical"]
 
-# 1) 截距重校准：logit(p*) = a + 1 * logit(p_raw)，仅重估截距 a
-for _cohort in EXTERNAL_COHORT_KEYS:
-    if _cohort not in preds_dict_raw:
-        print(f"  WARNING: {_cohort} not in preds_dict_raw, skipping intercept recalibration.")
-        continue
-    _y_true_c, _y_prob_raw_c = preds_dict_raw[_cohort]
-    _logit_p = np.log(np.clip(_y_prob_raw_c, 1e-6, 1 - 1e-6) / (1 - np.clip(_y_prob_raw_c, 1e-6, 1 - 1e-6)))
-    try:
-        _glm_res = sm.GLM(_y_true_c, np.ones((len(_y_true_c), 1)),
-                          family=sm.families.Binomial(), offset=_logit_p).fit()
-        _alpha_new = _glm_res.params[0]
-        _logit_new = _logit_p + _alpha_new
-        _y_prob_int = 1 / (1 + np.exp(-_logit_new))
-    except Exception as _e:
-        print(f"  WARNING: intercept recalibration failed for {_cohort}: {_e}; falling back to raw.")
-        _y_prob_int = _y_prob_raw_c
-    _fname_int = f"predicted_probabilities_{model_name}_{_cohort.lower()}_intercept_recalibrated.csv"
-    pd.DataFrame({
-        "y_true": _y_true_c,
-        "y_pred_prob_raw": _y_prob_raw_c,
-        "y_pred_prob_calibrated": _y_prob_int
-    }).to_csv(os.path.join(RESULT_DIR, _fname_int), index=False, float_format='%.6f')
-    print(f"  Intercept-recalibrated probabilities saved: {_fname_int}")
-
-# 2) 组织三套表格行（列顺序固定，仅保留存在的列）
+# 组织两套表格行（列顺序固定，仅保留存在的列）
 _TABLE2_COLS = ["Cohort", "Calibration_Status", "AUC", "AUC_CI_Lower", "AUC_CI_Upper",
                 "Brier", "Sensitivity", "Specificity", "Accuracy", "F1", "PPV", "NPV",
                 "Calib_Intercept", "Calib_Slope", "Calib_Slope_CI_Lower", "Calib_Slope_CI_Upper"]
@@ -2784,24 +2873,12 @@ def _subset_metrics(m, status, cohort):
             row[k] = m[k]
     return row
 
-_raw_rows, _platt_rows, _intercept_rows = [], [], []
+_raw_rows, _platt_rows = [], []
 for _cohort in EXTERNAL_COHORT_KEYS:
     if _cohort not in metrics_dict_raw or _cohort not in metrics_dict:
         continue
     _raw_rows.append(_subset_metrics(metrics_dict_raw[_cohort], "Raw", _cohort))
     _platt_rows.append(_subset_metrics(metrics_dict[_cohort], "Platt", _cohort))
-    # 截距重校准：读取文件后自行计算 Youden 阈值再计算指标
-    _fname_int = f"predicted_probabilities_{model_name}_{_cohort.lower()}_intercept_recalibrated.csv"
-    _fpath_int = os.path.join(RESULT_DIR, _fname_int)
-    if os.path.exists(_fpath_int):
-        _df_int = pd.read_csv(_fpath_int)
-        _y_true_i = _df_int["y_true"].values
-        _y_prob_i = _df_int["y_pred_prob_calibrated"].values
-        _cut_i = _youden_cutoff(_y_true_i, _y_prob_i)
-        _m_int = compute_metrics(_y_true_i, _y_prob_i, _cut_i)
-        _intercept_rows.append(_subset_metrics(_m_int, "Intercept", _cohort))
-    else:
-        print(f"  WARNING: {_fname_int} not found; skipping Intercept row for {_cohort}.")
 
 def _write_table(rows, out_name):
     if not rows:
@@ -2814,13 +2891,12 @@ def _write_table(rows, out_name):
 
 _write_table(_raw_rows, "Table2_Main_Raw_Validation.csv")
 _write_table(_platt_rows, "eTable1_Platt_Validation.csv")
-_write_table(_intercept_rows, "eTable2_Intercept_Validation.csv")
 
 # =============================================================================
 # Part 2 — 亚组脆弱性分析（原独立成长分析脚本的亚组部分，已并入本脚本）
 # =============================================================================
 # 说明：本部分直接复用内存中的模型、Derivation/Temporal 校准器与各队列预测概率，
-#       不再二次读盘。模型成长曲线已按需求移除（避免与前瞻验证的叙事重叠）。
+#       不再二次读盘。模型成长曲线已按需求移除（避免与盲法验证的叙事重叠）。
 #   2.1 亚组性能：精确反标准化年龄 + SCORE2 三分组 + Bootstrap AUC CI
 #   2.2 亚组校准对比：Raw vs Recalibrated 的 Brier/Slope
 #   2.3 Brier 改善棒棒糖图
@@ -2984,6 +3060,9 @@ else:
     subgroup_df = pd.DataFrame(subgroup_results)
     auc_mask = subgroup_df["Metric_Type"] == "AUC"
     n_auc_subgroups = int(auc_mask.sum())
+    # 先全量初始化为 False：非 AUC 亚组（样本不足，Metric_Type == "N/A"）不参与
+    # FDR 校正，若留空会写入 NaN，下游 06 读图时 ifelse(NA) 会导致颜色缺失
+    subgroup_df["Signif_Worse_FDR"] = False
     subgroup_df["P_Value_Bonferroni"] = np.nan
     subgroup_df["Signif_Worse_Bonferroni"] = False
     if n_auc_subgroups > 0:
@@ -3023,7 +3102,13 @@ else:
         subgroup_df.loc[auc_mask, "P_Value_Bonferroni"] = adj_p_bonf
         subgroup_df.loc[auc_mask, "Signif_Worse_Bonferroni"] = adj_p_bonf < 0.05
 
-    subgroup_df.to_csv(os.path.join(SUBGROUP_DIR, f"Subgroup_Performance_{model_name}.csv"), index=False)
+    # 布尔列以 "TRUE"/"FALSE" 大写写出：pandas 默认写 "True"/"False"，
+    # 而 R 的 as.logical() 只认大写，06 端虽已 toupper 兜底，这里两端都保证一致
+    subgroup_out = subgroup_df.copy()
+    for _c in ("Signif_Worse", "Signif_Worse_FDR", "Signif_Worse_Bonferroni"):
+        if _c in subgroup_out.columns:
+            subgroup_out[_c] = subgroup_out[_c].astype(bool).astype(str).str.upper()
+    subgroup_out.to_csv(os.path.join(SUBGROUP_DIR, f"Subgroup_Performance_{model_name}.csv"), index=False)
 
     auc_subgroups = subgroup_df[subgroup_df["Metric_Type"] == "AUC"].copy()
     if len(auc_subgroups) > 0:

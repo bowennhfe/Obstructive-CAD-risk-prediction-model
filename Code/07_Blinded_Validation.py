@@ -1,32 +1,32 @@
 # =============================================================================
-# 07_Prospective_Validation.py — Prospective Cohort External Validation
+# 07_Blinded_Validation.py — Blinded Cohort External Validation
 # =============================================================================
-# 功能：对最终模型进行前瞻性（Prospective）外部验证，做法与 05 中对
+# 功能：对最终模型进行盲法（Blinded）外部验证，做法与 05 中对
 #       Temporal / Geographical 队列的处理保持一致：
-#   1. 用与 01→02→03 完全一致的预处理链，将原始前瞻队列转换为模型输入特征
+#   1. 用与 01→02→03 完全一致的预处理链，将原始盲法队列转换为模型输入特征
 #      （raw → 派生比值 → log1p → 拟合好的插补器 → RobustScaler → one-hot）。
 #   2. 模型仅在 Derivation 上训练（不并入任何外部数据）。
-#   3. 前瞻队列计算两遍（由 --temporal-mode 开关控制策略）：
+#   3. 盲法队列计算两遍（由 --temporal-mode 开关控制策略）：
 #        [calibration，默认] (a) Raw          —— 原始概率；
 #                            (b) Recalibrated —— 用 Temporal 队列拟合校准器后重算。
 #        [merge]             (a) Before retraining —— Derivation-only 模型；
 #                            (b) After retraining  —— 并入 Temporal 重训后的模型（model revision）。
-#      用法：python 07_Prospective_Validation.py [--model X] [--temporal-mode calibration|merge]
+#      用法：python 07_Blinded_Validation.py [--model X] [--temporal-mode calibration|merge]
 #   4. 输出全部判别/校准/临床指标（Bootstrap 95% CI、Hosmer-Lemeshow、DCA）；
 #      校准曲线与决策曲线沿用既有脚本（05 / 06）的绘图风格。
 #
 # 输入：
-#   - prospective cohort.csv（原始，位于 E:\new）
+#   - blinded cohort.csv（原始，位于 E:\new）
 #   - feature_selection\{Derivation,Temporal} cohort.csv（已标准化）
 #   - Model Selection\best_params_all_models.pkl、model_selection_metrics.csv
 #   - data_preprocessing\preprocessing_objects.joblib（预处理参数）
-# 输出（E:\new\Prospective Validation\）：
-#   - 表格：prospective_validation_summary.csv, prospective_table1_baseline.csv,
-#           prospective_hosmer_lemeshow.csv, prospective_cutoff_sensitivity.csv,
-#           prospective_predictions.csv,
-#           prospective_auc_comparison.csv, prospective_calibrator.csv
+# 输出（E:\new\Blinded Validation\）：
+#   - 表格：blinded_validation_summary.csv, blinded_table1_baseline.csv,
+#           blinded_hosmer_lemeshow.csv, blinded_cutoff_sensitivity.csv,
+#           blinded_predictions.csv,
+#           blinded_auc_comparison.csv, blinded_calibrator.csv
 #   - 图：ROC, 校准曲线, DCA, 混淆矩阵, PR曲线, 概率分布 (PNG+PDF+TIF, 600dpi)
-#   - 报告：prospective_report.txt
+#   - 报告：blinded_report.txt
 # =============================================================================
 
 import os
@@ -41,13 +41,13 @@ import matplotlib.pyplot as plt
 from scipy.stats import norm, chi2, mannwhitneyu, chi2_contingency
 import joblib
 
+from sklearn.model_selection import train_test_split
 from sklearn.linear_model import LogisticRegression
 from sklearn.neighbors import KNeighborsClassifier
 from sklearn.tree import DecisionTreeClassifier
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.svm import SVC
 from sklearn.naive_bayes import GaussianNB
-from sklearn.neural_network import MLPClassifier
 from sklearn.calibration import calibration_curve
 from sklearn.metrics import (roc_auc_score, roc_curve, precision_recall_curve,
                              brier_score_loss, accuracy_score, recall_score,
@@ -93,10 +93,10 @@ BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DATA_DIR = os.path.join(BASE_DIR, "feature_selection")
 SELECTION_DIR = os.path.join(BASE_DIR, "Model Selection")
 PREPROC_DIR = os.path.join(BASE_DIR, "data_preprocessing")
-RESULT_DIR = os.path.join(BASE_DIR, "Prospective Validation")
+RESULT_DIR = os.path.join(BASE_DIR, "Blinded Validation")
 os.makedirs(RESULT_DIR, exist_ok=True)
 
-PROSPECTIVE_RAW = os.path.join(BASE_DIR, "prospective cohort.csv")
+BLINDED_RAW = os.path.join(BASE_DIR, "blinded cohort.csv")
 DERIVATION_RAW = os.path.join(BASE_DIR, "Derivation cohort.csv")
 
 # --- 绘图配色（沿用 05 的色盲友好配色方案） ---
@@ -348,9 +348,6 @@ def net_benefit_curve(y_true, y_prob, thresholds):
 def _get_fixed_params(model_name):
     if model_name == "L2_LR":
         return {"solver": "lbfgs", "max_iter": 5000, "random_state": RANDOM_STATE}
-    elif model_name == "MLP":
-        return {"max_iter": 2000, "early_stopping": True, "validation_fraction": 0.2,
-                "n_iter_no_change": 15, "random_state": RANDOM_STATE, "verbose": False}
     elif model_name == "KNN":
         return {"n_jobs": N_JOBS}
     elif model_name == "DT":
@@ -358,17 +355,24 @@ def _get_fixed_params(model_name):
     elif model_name == "RF":
         return {"random_state": RANDOM_STATE, "n_jobs": N_JOBS}
     elif model_name == "LightGBM":
-        return {"n_estimators": 200, "verbose": -1, "random_state": RANDOM_STATE, "n_jobs": N_JOBS}
+        # 与 04/05 一致：n_estimators=1000，早停通过 fit 的 callbacks 施加
+        return {"n_estimators": 1000, "verbose": -1, "random_state": RANDOM_STATE, "n_jobs": N_JOBS}
     elif model_name == "CatBoost":
-        return {"iterations": 500, "early_stopping_rounds": 50, "verbose": 0,
+        # 与 04/05 一致：iterations=1000 + early_stopping_rounds=50
+        return {"iterations": 1000, "early_stopping_rounds": 50, "verbose": 0,
                 "random_seed": RANDOM_STATE, "thread_count": max(1, os.cpu_count() or 1),
                 "train_dir": RESULT_DIR}
     elif model_name == "SVM":
-        return {"probability": True, "random_state": RANDOM_STATE}
+        # class_weight 与 04/05 的回退默认值保持一致（若 best_params 缺失该键，
+        # 07 才不会退化为 None 而与 05 的模型不一致）
+        return {"probability": True, "random_state": RANDOM_STATE,
+                "class_weight": "balanced"}
     elif model_name == "GaussianNB":
         return {}
     elif model_name == "XGBoost":
-        return {"n_estimators": 200, "verbosity": 0, "random_state": RANDOM_STATE, "n_jobs": N_JOBS}
+        # 与 04/05 一致：n_estimators=1000，构造参数内携带 early_stopping_rounds
+        return {"n_estimators": 1000, "early_stopping_rounds": 50, "eval_metric": "auc",
+                "verbosity": 0, "random_state": RANDOM_STATE, "n_jobs": N_JOBS}
     return {}
 
 
@@ -376,8 +380,6 @@ def build_model(model_name, params):
     merged = {**_get_fixed_params(model_name), **params}
     if model_name == "L2_LR":
         return LogisticRegression(penalty="l2", **merged)
-    elif model_name == "MLP":
-        return MLPClassifier(**merged)
     elif model_name == "KNN":
         return KNeighborsClassifier(**merged)
     elif model_name == "DT":
@@ -401,11 +403,37 @@ def build_model(model_name, params):
 
 
 def fit_predict(model_name, params, X_tr, y_tr, X_te):
+    """训练并预测。
+
+    树模型（LightGBM/XGBoost/CatBoost）与 04/05 对齐：在 train 内做分层 20% eval
+    set + early_stopping_rounds=50；其余模型全量拟合。此前 07 未使用早停，导致
+    calibration / merge 两套结果与 04/05 的模型不可比。
+    """
     clf = build_model(model_name, params)
     cols = [f"f{i}" for i in range(X_tr.shape[1])]
+    X_tr_df = pd.DataFrame(X_tr, columns=cols)
+    X_te_df = pd.DataFrame(X_te, columns=cols)
+    y_tr = np.asarray(y_tr)
+
+    if model_name in ("LightGBM", "XGBoost", "CatBoost"):
+        X_sub, X_val, y_sub, y_val = train_test_split(
+            X_tr_df, y_tr, test_size=0.2, random_state=RANDOM_STATE, stratify=y_tr
+        )
+        if model_name == "LightGBM":
+            import lightgbm as lgb
+            clf.fit(X_sub, y_sub,
+                    eval_set=[(X_val, y_val)],
+                    callbacks=[lgb.early_stopping(50, verbose=False)])
+        elif model_name == "XGBoost":
+            clf.fit(X_sub, y_sub, eval_set=[(X_val, y_val)], verbose=False)
+        else:  # CatBoost
+            clf.fit(X_sub, y_sub, eval_set=(X_val, y_val), verbose=False)
+        prob = clf.predict_proba(X_te_df)[:, 1]
+        return clf, prob
+
     try:
-        clf.fit(pd.DataFrame(X_tr, columns=cols), y_tr)
-        prob = clf.predict_proba(pd.DataFrame(X_te, columns=cols))[:, 1]
+        clf.fit(X_tr_df, y_tr)
+        prob = clf.predict_proba(X_te_df)[:, 1]
     except Exception:
         clf.fit(X_tr, y_tr)
         prob = clf.predict_proba(X_te)[:, 1]
@@ -413,7 +441,7 @@ def fit_predict(model_name, params, X_tr, y_tr, X_te):
 
 
 # =============================================================================
-# Preprocessing Reproduction: raw prospective -> model-ready scaled features
+# Preprocessing Reproduction: raw blinded -> model-ready scaled features
 # =============================================================================
 def transform_raw_cohort(raw_df, pp, model_feature_cols):
     numeric_cols = pp["numeric_cols"]
@@ -452,7 +480,9 @@ def transform_raw_cohort(raw_df, pp, model_feature_cols):
     for c in categorical_cols:
         vals = pp["encoders"][c]["values"]
         for v in vals[1:]:
-            rename_map[f"{c}_{v}"] = f"{c}" if len(vals) == 2 else _r_make_names(f"{c}_{v}")
+            # 与 R 端 make.names 完全一致：R 的 read.csv(check.names=TRUE) 不会把
+            # gender_1 简化成 gender，二分类也必须保留 _1 后缀，否则特征名对不上。
+            rename_map[f"{c}_{v}"] = _r_make_names(f"{c}_{v}")
     scaled = scaled.rename(columns=rename_map)
 
     missing = [c for c in model_feature_cols if c not in scaled.columns]
@@ -503,8 +533,10 @@ def plot_dca_reference(model_curves, prevalence, title_tag, primary_idx=0):
             alpha=0.6, label="Ideal (perfect)")
 
     primary_nb = None
+    model_nbs = []
     for i, mc in enumerate(model_curves):
         nb = net_benefit_curve(mc["y_true"], mc["y_prob"], thresholds)
+        model_nbs.append(nb)
         ax.plot(thresholds, nb, color=mc["color"], lw=2.4, label=mc["label"])
         if i == primary_idx:
             primary_nb = nb
@@ -516,7 +548,10 @@ def plot_dca_reference(model_curves, prevalence, title_tag, primary_idx=0):
                         label="Clinical value region")
 
     ax.set_xlim([0.0, 0.80])
-    ax.set_ylim([min(-0.05, float(np.nanmin(nb_all)) - 0.02), max(0.55, prevalence + 0.05)])
+    # y 下限只按模型曲线自适应：Treat All 在高阈值必然陡降到 -1 以下，
+    # 若纳入 ylim 会把模型曲线压成一条平线（与 06 DCA 的处理保持一致）。
+    y_lo = min([-0.05] + [float(np.nanmin(nb)) - 0.02 for nb in model_nbs]) if model_nbs else -0.05
+    ax.set_ylim([y_lo, max(0.55, prevalence + 0.05)])
     ax.set_xlabel("Threshold Probability", fontsize=12, fontweight="bold")
     ax.set_ylabel("Net Benefit", fontsize=12, fontweight="bold")
     ax.set_title(f"Decision Curve Analysis — {title_tag}")
@@ -529,7 +564,7 @@ def plot_dca_reference(model_curves, prevalence, title_tag, primary_idx=0):
 # MAIN
 # =============================================================================
 print("=" * 70)
-print("07_Prospective_Validation.py — Prospective Cohort External Validation")
+print("07_Blinded_Validation.py — Blinded Cohort External Validation")
 print("=" * 70)
 
 # --- best params & model selection ---
@@ -565,18 +600,18 @@ y_temp = temp_df["label"].values.astype(np.int32)
 print(f"Temporal (calibration set): {X_temp.shape}, Pos/Neg: {np.sum(y_temp==1)}/{np.sum(y_temp==0)}")
 print(f"Features ({len(feature_cols)}): {feature_cols}")
 
-# --- load & transform prospective ---
-prosp_raw = pd.read_csv(PROSPECTIVE_RAW)
-print(f"\nProspective raw: {prosp_raw.shape}")
-y_prosp = prosp_raw["label"].values.astype(np.int32)
-X_prosp = transform_raw_cohort(prosp_raw, pp, feature_cols).values.astype(np.float64)
-print(f"Prospective transformed: {X_prosp.shape}, Pos/Neg: {np.sum(y_prosp==1)}/{np.sum(y_prosp==0)}")
+# --- load & transform blinded ---
+blind_raw = pd.read_csv(BLINDED_RAW)
+print(f"\nBlinded raw: {blind_raw.shape}")
+y_blind = blind_raw["label"].values.astype(np.int32)
+X_blind = transform_raw_cohort(blind_raw, pp, feature_cols).values.astype(np.float64)
+print(f"Blinded transformed: {X_blind.shape}, Pos/Neg: {np.sum(y_blind==1)}/{np.sum(y_blind==0)}")
 
 # --- train model on Derivation only ---
 print(f"\n=== Training Final Model: {model_name} (Derivation only) ===")
 clf, der_prob = fit_predict(model_name, best_params, X_der, y_der, X_der)
 _, temp_prob = fit_predict(model_name, best_params, X_der, y_der, X_temp)
-_, prosp_prob_raw = fit_predict(model_name, best_params, X_der, y_der, X_prosp)
+_, blind_prob_raw = fit_predict(model_name, best_params, X_der, y_der, X_blind)
 print("  Training complete.")
 
 # --- 第二套结果：calibration 模式=时间集重校准；merge 模式=并入 Temporal 后重训 ---
@@ -588,7 +623,7 @@ if TEMPORAL_MODE == "merge":
           f"Pos/Neg: {np.sum(y_tr_m==1)}/{np.sum(y_tr_m==0)}")
     _, der_prob_m = fit_predict(model_name, best_params, X_tr_m, y_tr_m, X_der)
     _, temp_prob_m = fit_predict(model_name, best_params, X_tr_m, y_tr_m, X_temp)
-    _, prosp_prob_cal = fit_predict(model_name, best_params, X_tr_m, y_tr_m, X_prosp)
+    _, blind_prob_cal = fit_predict(model_name, best_params, X_tr_m, y_tr_m, X_blind)
     der_prob_cal = der_prob_m
     cal_a, cal_b = np.nan, np.nan
     # Temporal 已成为训练数据，故重训后模型不再做时间集重校准
@@ -603,7 +638,7 @@ else:
     cal_b = calib.intercept_[0]
     print(f"  Calibrator (logit scale): slope={cal_a:.4f}, intercept={cal_b:.4f}")
 
-    prosp_prob_cal = calib.predict_proba(_logit(prosp_prob_raw).reshape(-1, 1))[:, 1]
+    blind_prob_cal = calib.predict_proba(_logit(blind_prob_raw).reshape(-1, 1))[:, 1]
     der_prob_cal = calib.predict_proba(_logit(der_prob).reshape(-1, 1))[:, 1]
     # 校准后的截断值：把 Derivation 最优截断值经校准器映射到校准概率空间
     final_cutoff_cal = calib.predict_proba(np.array([[_logit(final_cutoff)]]))[:, 1][0]
@@ -612,38 +647,38 @@ else:
 # --- metrics (raw vs recalibrated) ---
 print("\n=== Metrics ===")
 m_der_der = compute_metrics(y_der, der_prob, final_cutoff)          # Derivation apparent
-m_prosp_raw = compute_metrics(y_prosp, prosp_prob_raw, final_cutoff)
-m_prosp_cal = compute_metrics(y_prosp, prosp_prob_cal, final_cutoff_cal)
+m_blind_raw = compute_metrics(y_blind, blind_prob_raw, final_cutoff)
+m_blind_cal = compute_metrics(y_blind, blind_prob_cal, final_cutoff_cal)
 
 def _fmt(m):
     return (f"AUC={m['AUC']:.3f} ({m['AUC_CI_Lower']:.3f}-{m['AUC_CI_Upper']:.3f}), "
             f"AUPRC={m['AUPRC']:.3f}, Brier={m['Brier']:.3f}")
 
 print(f"  Derivation (apparent)  : {_fmt(m_der_der)}")
-print(f"  Prospective [{SET1_NAME}] : {_fmt(m_prosp_raw)}")
-print(f"  Prospective [{SET2_NAME}] : {_fmt(m_prosp_cal)}")
-for tag, m in [(SET1_NAME, m_prosp_raw), (SET2_NAME, m_prosp_cal)]:
+print(f"  Blinded [{SET1_NAME}] : {_fmt(m_blind_raw)}")
+print(f"  Blinded [{SET2_NAME}] : {_fmt(m_blind_cal)}")
+for tag, m in [(SET1_NAME, m_blind_raw), (SET2_NAME, m_blind_cal)]:
     print(f"    [{tag}] clinical: Acc={m['Accuracy']:.3f}, Sens={m['Sensitivity']:.3f}, "
           f"Spec={m['Specificity']:.3f}, PPV={m['PPV']:.3f}, NPV={m['NPV']:.3f}, F1={m['F1']:.3f}")
     print(f"    [{tag}] calib   : Intercept={m['Calib_Intercept']:.3f}, "
           f"Slope={m['Calib_Slope']:.3f} ({m['Calib_Slope_CI_Lower']:.3f}-{m['Calib_Slope_CI_Upper']:.3f})")
 
 # HL tests
-hl_chi_raw, hl_dof_raw, hl_p_raw = hosmer_lemeshow_test(y_prosp, prosp_prob_raw, g=10)
-hl_chi_cal, hl_dof_cal, hl_p_cal = hosmer_lemeshow_test(y_prosp, prosp_prob_cal, g=10)
-print(f"  Hosmer-Lemeshow (Prospective): [{SET1_NAME}] chi2={hl_chi_raw:.3f}, p={hl_p_raw:.4f} | "
+hl_chi_raw, hl_dof_raw, hl_p_raw = hosmer_lemeshow_test(y_blind, blind_prob_raw, g=10)
+hl_chi_cal, hl_dof_cal, hl_p_cal = hosmer_lemeshow_test(y_blind, blind_prob_cal, g=10)
+print(f"  Hosmer-Lemeshow (Blinded): [{SET1_NAME}] chi2={hl_chi_raw:.3f}, p={hl_p_raw:.4f} | "
       f"[{SET2_NAME}] chi2={hl_chi_cal:.3f}, p={hl_p_cal:.4f}")
 
-# AUC comparison Derivation vs Prospective (AUC invariant to monotone recalibration)
-diff, d_lo, d_hi = _bootstrap_auc_diff_ci(y_der, der_prob, y_prosp, prosp_prob_raw)
+# AUC comparison Derivation vs Blinded (AUC invariant to monotone recalibration)
+diff, d_lo, d_hi = _bootstrap_auc_diff_ci(y_der, der_prob, y_blind, blind_prob_raw)
 z = diff / max((d_hi - d_lo) / (2 * 1.96), 1e-9)
 p_diff = 2 * (1 - norm.cdf(abs(z)))
-print(f"  AUC diff (Der-apparent − Prosp) = {diff:.3f} ({d_lo:.3f}-{d_hi:.3f}), p={p_diff:.3f}")
+print(f"  AUC diff (Der-apparent − Blinded) = {diff:.3f} ({d_lo:.3f}-{d_hi:.3f}), p={p_diff:.3f}")
 
 # 重训前 vs 重训后：同队列配对 Bootstrap 的 ΔAUC / ΔAUPRC（merge 模式）
 if TEMPORAL_MODE == "merge":
-    auc_delta, ad_lo, ad_hi = _paired_diff_ci(y_prosp, prosp_prob_cal, prosp_prob_raw, "auc")
-    auprc_delta, pd_lo, pd_hi = _paired_diff_ci(y_prosp, prosp_prob_cal, prosp_prob_raw, "auprc")
+    auc_delta, ad_lo, ad_hi = _paired_diff_ci(y_blind, blind_prob_cal, blind_prob_raw, "auc")
+    auprc_delta, pd_lo, pd_hi = _paired_diff_ci(y_blind, blind_prob_cal, blind_prob_raw, "auprc")
     print(f"  Delta AUC   (after - before) = {auc_delta:+.4f} ({ad_lo:+.4f}, {ad_hi:+.4f})")
     print(f"  Delta AUPRC (after - before) = {auprc_delta:+.4f} ({pd_lo:+.4f}, {pd_hi:+.4f})")
 else:
@@ -657,23 +692,23 @@ BIN_VARS = ["gender", "hypertension", "diabetes", "smoking"]
 der_raw = pd.read_csv(DERIVATION_RAW)
 der_ids = set(der_df["ID"].tolist())
 der_raw = der_raw[der_raw["ID"].isin(der_ids)]
-print(f"\nTable 1: Derivation n={len(der_raw)}, Prospective n={len(prosp_raw)}")
+print(f"\nTable 1: Derivation n={len(der_raw)}, Blinded n={len(blind_raw)}")
 
 t1_rows = []
 for v in CONT_VARS:
     a = der_raw[v].dropna().values
-    b = prosp_raw[v].dropna().values
+    b = blind_raw[v].dropna().values
     try:
         p = mannwhitneyu(a, b, alternative="two-sided").pvalue
     except ValueError:
         p = np.nan
     t1_rows.append({"Variable": v, "Type": "Continuous",
                     "Derivation (mean±SD)": f"{a.mean():.2f} ± {a.std():.2f}",
-                    "Prospective (mean±SD)": f"{b.mean():.2f} ± {b.std():.2f}",
+                    "Blinded (mean±SD)": f"{b.mean():.2f} ± {b.std():.2f}",
                     "P_value": p})
 for v in BIN_VARS:
     a = der_raw[v].dropna().astype(int).values
-    b = prosp_raw[v].dropna().astype(int).values
+    b = blind_raw[v].dropna().astype(int).values
     ct = pd.crosstab(np.r_[np.zeros(len(a)), np.ones(len(b))], np.r_[a, b])
     try:
         p = chi2_contingency(ct)[1]
@@ -681,100 +716,103 @@ for v in BIN_VARS:
         p = np.nan
     t1_rows.append({"Variable": v, "Type": "Binary",
                     "Derivation (n,%)": f"{int(a.sum())} ({100*a.mean():.1f}%)",
-                    "Prospective (n,%)": f"{int(b.sum())} ({100*b.mean():.1f}%)",
+                    "Blinded (n,%)": f"{int(b.sum())} ({100*b.mean():.1f}%)",
                     "P_value": p})
-pd.DataFrame(t1_rows).to_csv(os.path.join(RESULT_DIR, "prospective_table1_baseline.csv"),
+pd.DataFrame(t1_rows).to_csv(os.path.join(RESULT_DIR, "blinded_table1_baseline.csv"),
                              index=False, float_format="%.4f")
 
 # --- Cutoff sensitivity (on recalibrated probabilities) ---
-fpr, tpr, thr = roc_curve(y_prosp, prosp_prob_cal)
+fpr, tpr, thr = roc_curve(y_blind, blind_prob_cal)
 youden = tpr - fpr
 best_i = np.argmax(youden)
 self_cut = thr[best_i] if np.isfinite(thr[best_i]) else 0.5
-y_pred_self = (prosp_prob_cal >= self_cut).astype(int)
-tn_s, fp_s, fn_s, tp_s = confusion_matrix(y_prosp, y_pred_self, labels=[0, 1]).ravel()
+y_pred_self = (blind_prob_cal >= self_cut).astype(int)
+tn_s, fp_s, fn_s, tp_s = confusion_matrix(y_blind, y_pred_self, labels=[0, 1]).ravel()
 sens_s = tp_s / (tp_s + fn_s) if (tp_s + fn_s) else 0
 spec_s = tn_s / (tn_s + fp_s) if (tn_s + fp_s) else 0
 pd.DataFrame([
     {"Calibration": SET2_NAME, "Cutoff_Type": "Applied (Derivation optimal)",
-     "Cutoff": final_cutoff_cal, "Sensitivity": m_prosp_cal["Sensitivity"], "Specificity": m_prosp_cal["Specificity"]},
-    {"Calibration": SET2_NAME, "Cutoff_Type": "Self-optimal (Prospective Youden)",
+     "Cutoff": final_cutoff_cal, "Sensitivity": m_blind_cal["Sensitivity"], "Specificity": m_blind_cal["Specificity"]},
+    {"Calibration": SET2_NAME, "Cutoff_Type": "Self-optimal (Blinded Youden)",
      "Cutoff": self_cut, "Sensitivity": sens_s, "Specificity": spec_s},
-]).to_csv(os.path.join(RESULT_DIR, "prospective_cutoff_sensitivity.csv"),
+]).to_csv(os.path.join(RESULT_DIR, "blinded_cutoff_sensitivity.csv"),
           index=False, float_format="%.6f")
 
-# --- Summary table (仅前瞻、第二套结果) ---
+# --- Summary table (仅盲法、第二套结果) ---
 def _row(cohort, status, n, events, m, auc_est):
     r = {"Cohort": cohort, "Model": model_name, "Calibration_Status": status,
          "AUC_Estimation": auc_est, "N": n, "Events": events}
     r.update(m)
     return r
 summary = pd.DataFrame([
-    _row("Prospective", SET2_NAME, len(y_prosp), int(np.sum(y_prosp == 1)),
-         m_prosp_cal, "Derivation + Temporal training set" if TEMPORAL_MODE == "merge"
+    _row("Blinded", SET2_NAME, len(y_blind), int(np.sum(y_blind == 1)),
+         m_blind_cal, "Derivation + Temporal training set" if TEMPORAL_MODE == "merge"
          else "Bootstrap mean (calibrated probs)"),
 ])
 front = ["Cohort", "Model", "Calibration_Status", "AUC_Estimation", "N", "Events"]
 summary = summary[front + [c for c in summary.columns if c not in front]]
-summary.to_csv(os.path.join(RESULT_DIR, "prospective_validation_summary.csv"),
+summary.to_csv(os.path.join(RESULT_DIR, "blinded_validation_summary.csv"),
                index=False, float_format="%.4f")
 
 # --- Calibrator table ---
 pd.DataFrame([{"Temporal_Mode": TEMPORAL_MODE, "Calibration_Set": "Temporal" if TEMPORAL_MODE == "calibration" else "(none)",
                "Slope_logit": cal_a, "Intercept_logit": cal_b,
                "Cutoff_Raw": final_cutoff, "Cutoff_Recalibrated": final_cutoff_cal}]).to_csv(
-    os.path.join(RESULT_DIR, "prospective_calibrator.csv"), index=False, float_format="%.6f")
+    # merge 模式下校准器不存在（cal_a/cal_b 为 NaN），统一写空字段而非 "NaN"，
+    # 避免 R 端 read.csv 把它读成字符串 "NaN" 后误当有效系数。
+    os.path.join(RESULT_DIR, "blinded_calibrator.csv"),
+    index=False, float_format="%.6f", na_rep="")
 
 # --- HL table (仅第二套结果) ---
 pd.DataFrame([
-    {"Cohort": "Prospective", "Calibration_Status": SET2_NAME,
+    {"Cohort": "Blinded", "Calibration_Status": SET2_NAME,
      "Chi2": hl_chi_cal, "df": hl_dof_cal, "P_value": hl_p_cal},
-]).to_csv(os.path.join(RESULT_DIR, "prospective_hosmer_lemeshow.csv"), index=False, float_format="%.4f")
+]).to_csv(os.path.join(RESULT_DIR, "blinded_hosmer_lemeshow.csv"), index=False, float_format="%.4f")
 
 # --- AUC comparison table ---
-pd.DataFrame([{"Comparison": "Derivation vs Prospective", "AUC_Diff": diff,
+pd.DataFrame([{"Comparison": "Derivation vs Blinded", "AUC_Diff": diff,
                "CI_Lower": d_lo, "CI_Upper": d_hi, "P_value": p_diff}]).to_csv(
-    os.path.join(RESULT_DIR, "prospective_auc_comparison.csv"), index=False, float_format="%.4f")
+    os.path.join(RESULT_DIR, "blinded_auc_comparison.csv"), index=False, float_format="%.4f")
 
 # --- 重训前 vs 重训后 判别力对比表（merge 模式）---
 if TEMPORAL_MODE == "merge":
     pd.DataFrame([
-        {"Comparison": "After retraining vs Before retraining (Prospective)", "Metric": "AUC",
-         "Before": m_prosp_raw["AUC"], "After": m_prosp_cal["AUC"],
+        {"Comparison": "After retraining vs Before retraining (Blinded)", "Metric": "AUC",
+         "Before": m_blind_raw["AUC"], "After": m_blind_cal["AUC"],
          "Delta": auc_delta, "CI_Lower": ad_lo, "CI_Upper": ad_hi},
-        {"Comparison": "After retraining vs Before retraining (Prospective)", "Metric": "AUPRC",
-         "Before": m_prosp_raw["AUPRC"], "After": m_prosp_cal["AUPRC"],
+        {"Comparison": "After retraining vs Before retraining (Blinded)", "Metric": "AUPRC",
+         "Before": m_blind_raw["AUPRC"], "After": m_blind_cal["AUPRC"],
          "Delta": auprc_delta, "CI_Lower": pd_lo, "CI_Upper": pd_hi},
-    ]).to_csv(os.path.join(RESULT_DIR, "prospective_retrain_comparison.csv"),
+    ]).to_csv(os.path.join(RESULT_DIR, "blinded_retrain_comparison.csv"),
               index=False, float_format="%.4f")
 
 # --- predictions file ---
 pred_cols = {
-    "ID": prosp_raw["ID"].values,
-    "label": y_prosp,
-    "probsp_raw": prosp_prob_raw,
-    "probsp_recalibrated": prosp_prob_cal,
-    "predicted_class": (prosp_prob_cal >= final_cutoff_cal).astype(int),
+    "ID": blind_raw["ID"].values,
+    "label": y_blind,
+    "prob_blind_raw": blind_prob_raw,
+    "prob_blind_recalibrated": blind_prob_cal,
+    "predicted_class": (blind_prob_cal >= final_cutoff_cal).astype(int),
 }
 if TEMPORAL_MODE == "merge":
-    pred_cols["probsp_retrained"] = prosp_prob_cal   # 并入 Temporal 后重训模型的概率
-pd.DataFrame(pred_cols).to_csv(os.path.join(RESULT_DIR, "prospective_predictions.csv"),
+    pred_cols["prob_blind_retrained"] = blind_prob_cal   # 并入 Temporal 后重训模型的概率
+pd.DataFrame(pred_cols).to_csv(os.path.join(RESULT_DIR, "blinded_predictions.csv"),
                                index=False, float_format="%.6f")
 
-# --- 供 R 端 (07_Prospective_Validation.R) 使用的原始概率导出 ---
-t_cols = {"label": y_temp, "probsp_raw": temp_prob}
-d_cols = {"label": y_der, "probsp_raw": der_prob}
+# --- 供 R 端 (07_Blinded_Validation.R) 使用的原始概率导出 ---
+t_cols = {"label": y_temp, "prob_blind_raw": temp_prob}
+d_cols = {"label": y_der, "prob_blind_raw": der_prob}
 if TEMPORAL_MODE == "merge":
-    t_cols["probsp_retrained"] = temp_prob_m
-    d_cols["probsp_retrained"] = der_prob_m
+    t_cols["prob_blind_retrained"] = temp_prob_m
+    d_cols["prob_blind_retrained"] = der_prob_m
 pd.DataFrame(t_cols).to_csv(os.path.join(RESULT_DIR, "temporal_predictions.csv"),
                             index=False, float_format="%.6f")
 pd.DataFrame(d_cols).to_csv(os.path.join(RESULT_DIR, "derivation_predictions.csv"),
                             index=False, float_format="%.6f")
 pd.DataFrame({
-    "label": y_prosp,
-    "probsp_raw": prosp_prob_raw,
-}).to_csv(os.path.join(RESULT_DIR, "prospective_predictions_raw.csv"), index=False, float_format="%.6f")
+    "label": y_blind,
+    "prob_blind_raw": blind_prob_raw,
+}).to_csv(os.path.join(RESULT_DIR, "blinded_predictions_raw.csv"), index=False, float_format="%.6f")
 
 # --- 模式标记（供 R 端读取：以何种策略生成上述概率）---
 with open(os.path.join(RESULT_DIR, "temporal_mode.txt"), "w", encoding="utf-8") as f:
@@ -786,47 +824,47 @@ with open(os.path.join(RESULT_DIR, "temporal_mode.txt"), "w", encoding="utf-8") 
 print("\n=== Generating Figures ===")
 
 # 需要对比展示的两套概率（merge 模式下为“重训前 / 重训后”两条曲线）
-fig_sets = [(SET1_NAME, prosp_prob_raw, COLOR_RAW, m_prosp_raw),
-            (SET2_NAME, prosp_prob_cal, COLOR_CAL, m_prosp_cal)]
+fig_sets = [(SET1_NAME, blind_prob_raw, COLOR_RAW, m_blind_raw),
+            (SET2_NAME, blind_prob_cal, COLOR_CAL, m_blind_cal)]
 if TEMPORAL_MODE == "calibration":
     fig_sets = fig_sets[1:]   # 单调校准不改变排序，故只画第二套避免完全重叠
 
-# (1) ROC — 前瞻（merge 模式下同时画重训前后两条曲线）
+# (1) ROC — 盲法（merge 模式下同时画重训前后两条曲线）
 fig, ax = plt.subplots(figsize=(6.5, 6))
 for _name, _p, _col, _m in fig_sets:
-    _fpr, _tpr, _ = roc_curve(y_prosp, _p)
+    _fpr, _tpr, _ = roc_curve(y_blind, _p)
     ax.plot(_fpr, _tpr, color=_col, lw=2.4,
             label=f"{_name} AUC={_m['AUC']:.3f} ({_m['AUC_CI_Lower']:.3f}-{_m['AUC_CI_Upper']:.3f})")
 ax.plot([0, 1], [0, 1], color="gray", lw=1, ls=":")
 ax.set_xlabel("1 − Specificity", fontweight="bold")
 ax.set_ylabel("Sensitivity", fontweight="bold")
-ax.set_title(f"ROC Curve — Prospective Validation ({model_name})")
+ax.set_title(f"ROC Curve — Blinded Validation ({model_name})")
 ax.legend(loc="lower right", fontsize=8)
 ax.grid(alpha=0.3)
-save_figure(fig, "prosp_roc")
+save_figure(fig, "blind_roc")
 print("  [1/6] ROC saved")
 
 # (2) Calibration — 第二套结果（参考 05 风格）
 cal_curves = [
-    {"label": f"Prospective {SET2_NAME}", "y_true": y_prosp, "y_prob": prosp_prob_cal,
+    {"label": f"Blinded {SET2_NAME}", "y_true": y_blind, "y_prob": blind_prob_cal,
      "color": COLOR_CAL, "hl_p": hl_p_cal},
 ]
-fig = plot_calibration_reference(cal_curves, f"Prospective ({model_name})")
-save_figure(fig, "prosp_calibration")
+fig = plot_calibration_reference(cal_curves, f"Blinded ({model_name})")
+save_figure(fig, "blind_calibration")
 print("  [2/6] Calibration saved")
 
 # (3) DCA — 第二套结果（参考 07 风格）
-prev_prosp = float(np.mean(y_prosp))
+prev_blind = float(np.mean(y_blind))
 dca_curves = [
-    {"label": SET2_NAME, "y_true": y_prosp, "y_prob": prosp_prob_cal, "color": COLOR_CAL},
+    {"label": SET2_NAME, "y_true": y_blind, "y_prob": blind_prob_cal, "color": COLOR_CAL},
 ]
-fig = plot_dca_reference(dca_curves, prev_prosp, f"Prospective ({model_name})", primary_idx=0)
-save_figure(fig, "prosp_dca")
+fig = plot_dca_reference(dca_curves, prev_blind, f"Blinded ({model_name})", primary_idx=0)
+save_figure(fig, "blind_dca")
 print("  [3/6] DCA saved")
 
 # (4) Confusion matrix — 仅校准后
 fig, ax = plt.subplots(figsize=(5.5, 5))
-cm = confusion_matrix(y_prosp, (prosp_prob_cal >= final_cutoff_cal).astype(int), labels=[0, 1])
+cm = confusion_matrix(y_blind, (blind_prob_cal >= final_cutoff_cal).astype(int), labels=[0, 1])
 im = ax.imshow(cm, cmap="Blues")
 for i in range(2):
     for j in range(2):
@@ -834,38 +872,38 @@ for i in range(2):
                 color="white" if cm[i, j] > cm.max() / 2 else "black", fontsize=16, fontweight="bold")
 ax.set_xticks([0, 1]); ax.set_xticklabels(["Pred Neg", "Pred Pos"])
 ax.set_yticks([0, 1]); ax.set_yticklabels(["True Neg", "True Pos"])
-ax.set_title(f"Confusion Matrix — Prospective ({SET2_TAG})\n(cutoff={final_cutoff_cal:.3f})")
+ax.set_title(f"Confusion Matrix — Blinded ({SET2_TAG})\n(cutoff={final_cutoff_cal:.3f})")
 fig.colorbar(im, ax=ax, shrink=0.8)
-save_figure(fig, "prosp_confusion_matrix")
+save_figure(fig, "blind_confusion_matrix")
 print("  [4/6] Confusion matrix saved")
 
 # (5) PR curve（merge 模式下同时画重训前后两条曲线）
 fig, ax = plt.subplots(figsize=(6.5, 5.5))
 for _name, _p, _col, _m in fig_sets:
-    _prec, _rec, _ = precision_recall_curve(y_prosp, _p)
+    _prec, _rec, _ = precision_recall_curve(y_blind, _p)
     ax.plot(_rec, _prec, color=_col, lw=2.4,
             label=f"{_name} AUPRC={_m['AUPRC']:.3f} "
                   f"({_m['AUPRC_CI_Lower']:.3f}-{_m['AUPRC_CI_Upper']:.3f})")
-ax.axhline(prev_prosp, color="gray", ls="--", lw=1.2, label=f"Baseline (prevalence) = {prev_prosp:.3f}")
+ax.axhline(prev_blind, color="gray", ls="--", lw=1.2, label=f"Baseline (prevalence) = {prev_blind:.3f}")
 ax.set_xlabel("Recall (Sensitivity)", fontweight="bold")
 ax.set_ylabel("Precision (PPV)", fontweight="bold")
-ax.set_title(f"Precision-Recall Curve — Prospective ({model_name})")
+ax.set_title(f"Precision-Recall Curve — Blinded ({model_name})")
 ax.legend(loc="upper right", fontsize=8)
 ax.grid(alpha=0.3)
-save_figure(fig, "prosp_pr_curve")
+save_figure(fig, "blind_pr_curve")
 print("  [5/6] PR curve saved")
 
 # (6) Probability distribution — 仅校准后
 fig, ax = plt.subplots(figsize=(7, 5.5))
-ax.hist(prosp_prob_cal[y_prosp == 0], bins=20, alpha=0.6, color="#1f77b4", label="No Event", density=True)
-ax.hist(prosp_prob_cal[y_prosp == 1], bins=20, alpha=0.6, color="#d62728", label="Event", density=True)
+ax.hist(blind_prob_cal[y_blind == 0], bins=20, alpha=0.6, color="#1f77b4", label="No Event", density=True)
+ax.hist(blind_prob_cal[y_blind == 1], bins=20, alpha=0.6, color="#d62728", label="Event", density=True)
 ax.axvline(final_cutoff_cal, color="black", ls="--", lw=1.5, label=f"Cutoff = {final_cutoff_cal:.3f}")
 ax.set_xlabel("Predicted Probability", fontweight="bold")
 ax.set_ylabel("Density", fontweight="bold")
-ax.set_title(f"Predicted Probability Distribution — Prospective ({SET2_TAG})")
+ax.set_title(f"Predicted Probability Distribution — Blinded ({SET2_TAG})")
 ax.legend(loc="upper center", fontsize=9)
 ax.grid(alpha=0.3, axis="y")
-save_figure(fig, "prosp_probability_distribution")
+save_figure(fig, "blind_probability_distribution")
 print("  [6/6] Probability distribution saved")
 
 # =============================================================================
@@ -873,50 +911,55 @@ print("  [6/6] Probability distribution saved")
 # =============================================================================
 lines = []
 lines.append("=" * 70)
-lines.append("Prospective Cohort External Validation Report")
+lines.append("Blinded Cohort External Validation Report")
 lines.append("=" * 70)
 lines.append(f"Temporal strategy: {TEMPORAL_MODE}")
 if TEMPORAL_MODE == "merge":
     lines.append(f"Model: {model_name} retrained on Derivation + Temporal (n={len(y_der)+len(y_temp)})")
     lines.append("Recalibrator: none (Temporal is part of the training set)")
-    lines.append(f"Cutoff: {final_cutoff:.4f} (Derivation optimal, applied to both models)")
+    lines.append(f"Cutoff: {final_cutoff:.4f} (Derivation optimal, applied to BOTH models)")
+    lines.append("  NOTE: the retrained model may have a different probability scale; "
+                 "the same Derivation-optimal cutoff is applied to both models for "
+                 "comparability and was NOT re-optimized on the retrained model.")
 else:
     lines.append(f"Model: {model_name} (trained on Derivation only, n={len(y_der)})")
     lines.append(f"Recalibrator: Platt (logit) fitted on Temporal (n={len(y_temp)}); "
                  f"slope={cal_a:.4f}, intercept={cal_b:.4f}")
     lines.append(f"Cutoff: raw={final_cutoff:.4f} -> recalibrated={final_cutoff_cal:.4f}")
+lines.append(f"Cutoff source: 04_Model_Selection.py 重复嵌套 CV 的重复级 Optimal_Cutoff "
+             f"中位数（N_REPEATS 次重复）")
 lines.append(f"Features ({len(feature_cols)}): {', '.join(feature_cols)}")
 lines.append("")
 lines.append(f"[Cohorts] Derivation n={len(y_der)} (events={int(np.sum(y_der==1))}); "
              f"Temporal n={len(y_temp)} (events={int(np.sum(y_temp==1))}, "
              f"{'training' if TEMPORAL_MODE == 'merge' else 'calibration only'}); "
-             f"Prospective n={len(y_prosp)} (events={int(np.sum(y_prosp==1))}, "
-             f"prevalence={np.mean(y_prosp):.3f})")
+             f"Blinded n={len(y_blind)} (events={int(np.sum(y_blind==1))}, "
+             f"prevalence={np.mean(y_blind):.3f})")
 lines.append("")
-lines.append("[Discrimination — Prospective]")
-lines.append(f"  {SET1_NAME}: AUC={m_prosp_raw['AUC']:.3f} ({m_prosp_raw['AUC_CI_Lower']:.3f}-{m_prosp_raw['AUC_CI_Upper']:.3f}), "
-             f"AUPRC={m_prosp_raw['AUPRC']:.3f} ({m_prosp_raw['AUPRC_CI_Lower']:.3f}-{m_prosp_raw['AUPRC_CI_Upper']:.3f})")
-lines.append(f"  {SET2_NAME}: AUC={m_prosp_cal['AUC']:.3f} ({m_prosp_cal['AUC_CI_Lower']:.3f}-{m_prosp_cal['AUC_CI_Upper']:.3f}), "
-             f"AUPRC={m_prosp_cal['AUPRC']:.3f} ({m_prosp_cal['AUPRC_CI_Lower']:.3f}-{m_prosp_cal['AUPRC_CI_Upper']:.3f})")
+lines.append("[Discrimination — Blinded]")
+lines.append(f"  {SET1_NAME}: AUC={m_blind_raw['AUC']:.3f} ({m_blind_raw['AUC_CI_Lower']:.3f}-{m_blind_raw['AUC_CI_Upper']:.3f}), "
+             f"AUPRC={m_blind_raw['AUPRC']:.3f} ({m_blind_raw['AUPRC_CI_Lower']:.3f}-{m_blind_raw['AUPRC_CI_Upper']:.3f})")
+lines.append(f"  {SET2_NAME}: AUC={m_blind_cal['AUC']:.3f} ({m_blind_cal['AUC_CI_Lower']:.3f}-{m_blind_cal['AUC_CI_Upper']:.3f}), "
+             f"AUPRC={m_blind_cal['AUPRC']:.3f} ({m_blind_cal['AUPRC_CI_Lower']:.3f}-{m_blind_cal['AUPRC_CI_Upper']:.3f})")
 if TEMPORAL_MODE == "merge":
     lines.append(f"  Delta AUC   (after - before) = {auc_delta:+.4f} ({ad_lo:+.4f}, {ad_hi:+.4f})")
     lines.append(f"  Delta AUPRC (after - before) = {auprc_delta:+.4f} ({pd_lo:+.4f}, {pd_hi:+.4f})")
-lines.append(f"  Derivation apparent vs Prospective (before): diff={diff:.3f} ({d_lo:.3f}-{d_hi:.3f}), p={p_diff:.4f}")
+lines.append(f"  Derivation apparent vs Blinded (before): diff={diff:.3f} ({d_lo:.3f}-{d_hi:.3f}), p={p_diff:.4f}")
 lines.append("")
-lines.append(f"[Prospective — {SET2_NAME}]")
-lines.append(f"  Brier={m_prosp_cal['Brier']:.4f}; Calib Intercept={m_prosp_cal['Calib_Intercept']:.3f}, "
-             f"Slope={m_prosp_cal['Calib_Slope']:.3f} "
-             f"({m_prosp_cal['Calib_Slope_CI_Lower']:.3f}-{m_prosp_cal['Calib_Slope_CI_Upper']:.3f}); "
+lines.append(f"[Blinded — {SET2_NAME}]")
+lines.append(f"  Brier={m_blind_cal['Brier']:.4f}; Calib Intercept={m_blind_cal['Calib_Intercept']:.3f}, "
+             f"Slope={m_blind_cal['Calib_Slope']:.3f} "
+             f"({m_blind_cal['Calib_Slope_CI_Lower']:.3f}-{m_blind_cal['Calib_Slope_CI_Upper']:.3f}); "
              f"HL chi2={hl_chi_cal:.3f}, p={hl_p_cal:.4f}")
-lines.append(f"  Acc={m_prosp_cal['Accuracy']:.3f}, Sens={m_prosp_cal['Sensitivity']:.3f}, "
-             f"Spec={m_prosp_cal['Specificity']:.3f}, PPV={m_prosp_cal['PPV']:.3f}, "
-             f"NPV={m_prosp_cal['NPV']:.3f}, F1={m_prosp_cal['F1']:.3f}")
+lines.append(f"  Acc={m_blind_cal['Accuracy']:.3f}, Sens={m_blind_cal['Sensitivity']:.3f}, "
+             f"Spec={m_blind_cal['Specificity']:.3f}, PPV={m_blind_cal['PPV']:.3f}, "
+             f"NPV={m_blind_cal['NPV']:.3f}, F1={m_blind_cal['F1']:.3f}")
 lines.append("")
 lines.append("Outputs saved to: " + RESULT_DIR)
 lines.append("=" * 70)
 report = "\n".join(lines)
-with open(os.path.join(RESULT_DIR, "prospective_report.txt"), "w", encoding="utf-8") as f:
+with open(os.path.join(RESULT_DIR, "blinded_report.txt"), "w", encoding="utf-8") as f:
     f.write(report)
 print("\n" + report)
 
-print("\n=== Prospective Validation Complete ===")
+print("\n=== Blinded Validation Complete ===")
